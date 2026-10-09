@@ -1,3 +1,4 @@
+import re
 import sqlite3
 import threading
 from collections.abc import Iterator
@@ -136,6 +137,8 @@ CREATE TABLE idempotency (
 );
 """
 
+_SCHEMA_TABLES = frozenset(re.findall(r"^CREATE TABLE (\w+)", SCHEMA, re.MULTILINE))
+
 
 class Database:
     def __init__(self, home: Path) -> None:
@@ -144,7 +147,12 @@ class Database:
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(SCHEMA)
+        existing = {
+            row["name"]
+            for row in self._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        if not _SCHEMA_TABLES <= existing:
+            self._conn.executescript(SCHEMA)
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

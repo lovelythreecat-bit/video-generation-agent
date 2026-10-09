@@ -40,6 +40,19 @@ def test_transaction_rolls_back(tmp_path: Path):
     assert count == 0
 
 
+def test_second_open_reads_written_row(tmp_path: Path):
+    first = Database(tmp_path)
+    with first.transaction() as conn:
+        conn.execute(
+            "INSERT INTO assets (asset_id, kind, filename, media_type, byte_size, relative_path, created_at) VALUES ('a', 'image', 'a.png', 'image/png', 1, 'assets/a/a.png', 't')"
+        )
+    second = Database(tmp_path)
+    with second.transaction() as conn:
+        row = conn.execute("SELECT asset_id, filename FROM assets WHERE asset_id='a'").fetchone()
+    assert row["asset_id"] == "a"
+    assert row["filename"] == "a.png"
+
+
 def test_another_thread_can_write(tmp_path: Path):
     database = Database(tmp_path)
     errors: list[BaseException] = []

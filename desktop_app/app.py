@@ -293,8 +293,6 @@ class MainWindow(tk.Tk):
             return
         self.selected_id = self._task_ids[picked[0]]
         self._images_changed = False
-        self._image_ids = []
-        self._image_names = []
         self.reload_selected(refill_form=True)
 
     def reload_selected(self, *, refill_form: bool) -> None:
@@ -342,24 +340,43 @@ class MainWindow(tk.Tk):
         task = self.current
         if task is None:
             return
-        self.name_var.set(task.product_name or "")
-        self.category_var.set("")
-        self.specs_var.set("")
+        info = task.product_info
+        self.name_var.set(info.name or task.product_name or "")
+        self.category_var.set(info.category or "")
+        self.specs_var.set(info.specs or "")
         self.selling_text.delete("1.0", "end")
+        self.selling_text.insert("1.0", "\n".join(info.selling_points))
         self.prompt_text.delete("1.0", "end")
+        self.prompt_text.insert("1.0", task.user_prompt)
         self.instruction_var.set("")
         self.clear_music_var.set(False)
+        self._image_ids = list(task.image_asset_ids)
+        self._image_names = list(task.image_asset_ids)
+        self.image_list.delete(0, "end")
+        for image_id, name in zip(self._image_ids, self._image_names):
+            self.image_list.insert("end", first_frame_label(name, image_id))
         plan = self._load_display_plan()
         self.head_plan = self._load_head()
         self._set_plan_summary(plan)
         if plan is None:
-            self.duration_var.set(str(self.default_duration))
-            self.aspect_var.set("9:16")
+            video = task.video_options
+            audio = task.audio_options
+            duration = video.duration_seconds if video.duration_seconds is not None else self.default_duration
+            self.duration_var.set(str(duration))
+            self.aspect_var.set(video.aspect_ratio)
+            self.subtitles_var.set(video.subtitles)
+            self.voiceover_var.set(video.voiceover)
+            self.music_var.set(video.music)
+            self.language_var.set(audio.language or "")
+            self.voice_pref_var.set(audio.voice_preference)
+            self.music_dir_var.set(audio.music_direction)
+            self._music_asset_id = audio.music_asset_id
+            self.music_label.configure(text=f"已登记音乐：{audio.music_asset_id or ''}")
             self.plan_duration_var.set(str(self.default_duration))
             self.plan_aspect_var.set("9:16")
             self.plan_fit_var.set("pad")
-            self._music_asset_id = None
-            self._set_first_frame(None, "generate")
+            source = "selected" if task.first_frame_asset_id else "generate"
+            self._set_first_frame(task.first_frame_asset_id, source)
             self._rebuild_shot_editors(None)
             return
         doc = plan.document
