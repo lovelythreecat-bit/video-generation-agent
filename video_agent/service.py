@@ -23,12 +23,18 @@ from video_agent.idempotency import (
     validate_idempotency_key,
 )
 from video_agent.models import (
+    ArtifactView,
     AudioOptions,
     CreateTaskRequest,
+    FailureView,
+    GenerationView,
     InputPatch,
     PlanChange,
+    PlanDocument,
+    PlanView,
     ProductInfo,
     RegenerateRequest,
+    TaskSummary,
     TaskView,
     TickResult,
     VideoOptions,
@@ -183,6 +189,100 @@ class VideoAgent:
     def get_task(self, task_id: str) -> TaskView:
         with self.db.transaction() as conn:
             return read_task_view(conn, task_id)
+
+    def list_tasks(self) -> list[TaskSummary]:
+        with self.db.transaction() as conn:
+            rows = conn.execute("SELECT * FROM tasks ORDER BY updated_at DESC, task_id DESC").fetchall()
+        summaries = []
+        for row in rows:
+            product = json.loads(row["product_info_json"])
+            summaries.append(
+                TaskSummary(
+                    task_id=row["task_id"],
+                    status=row["status"],
+                    product_name=product.get("name"),
+                    updated_at=row["updated_at"],
+                )
+            )
+        return summaries
+
+    def get_plan(self, task_id: str, plan_version: int) -> PlanView:
+        with self.db.transaction() as conn:
+            task = read_task_row(conn, task_id)
+            row = conn.execute(
+                "SELECT * FROM plan_versions WHERE task_id=? AND plan_version=?",
+                (task_id, plan_version),
+            ).fetchone()
+            if row is None:
+                raise VideoAgentError("NOT_FOUND", "方案不存在", task_id=task_id, plan_version=plan_version)
+            return PlanView(
+                task_id=task_id,
+                plan_version=plan_version,
+                is_head=task["head_plan_version"] == plan_version,
+                confirmed=task["confirmed_plan_version"] == plan_version,
+                abandoned=bool(row["abandoned"]),
+                document=PlanDocument.model_validate_json(row["document_json"]),
+            )
+
+    def get_generation(self, generation_id: str) -> GenerationView:
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT * FROM generations WHERE generation_id=?", (generation_id,)).fetchone()
+            if row is None:
+                raise VideoAgentError("NOT_FOUND", "执行不存在", generation_id=generation_id)
+            failure = None
+            if row["failure_code"]:
+                failure = FailureView(
+                    code=row["failure_code"],
+                    message=row["failure_message"] or "",
+                    stage=row["failure_stage"],
+                    retryable=bool(row["failure_retryable"]),
+                )
+            return GenerationView(
+                generation_id=row["generation_id"],
+                task_id=row["task_id"],
+                plan_version=row["plan_version"],
+                kind=row["kind"],
+                shot_ids=json.loads(row["shot_ids_json"]),
+                base_artifact_id=row["base_artifact_id"],
+                status=row["status"],
+                stage=row["stage"],
+                stage_detail=row["stage_detail"],
+                completed_shots=row["completed_shots"],
+                total_shots=row["total_shots"],
+                failure=failure,
+            )
+
+    def list_artifacts(self, task_id: str) -> list[ArtifactView]:
+        with self.db.transaction() as conn:
+            read_task_row(conn, task_id)
+            rows = conn.execute(
+                "SELECT * FROM artifacts WHERE task_id=? ORDER BY version DESC",
+                (task_id,),
+            ).fetchall()
+        return [
+            ArtifactView(
+                artifact_id=row["artifact_id"],
+                task_id=row["task_id"],
+                generation_id=row["generation_id"],
+                plan_version=row["plan_version"],
+                version=row["version"],
+                duration_seconds=row["duration_seconds"],
+                aspect_ratio=row["aspect_ratio"],
+                width=row["width"],
+                height=row["height"],
+                quality_status=row["quality_status"],
+                quality=json.loads(row["quality_json"]),
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    def artifact_path(self, artifact_id: str) -> Path:
+        with self.db.transaction() as conn:
+            row = conn.execute("SELECT relative_path FROM artifacts WHERE artifact_id=?", (artifact_id,)).fetchone()
+            if row is None:
+                raise VideoAgentError("NOT_FOUND", "成品不存在")
+            return self.files.path_for(row["relative_path"])
 
     def submit_inputs(self, task_id: str, patch: InputPatch, *, idempotency_key: str | None = None) -> TaskView:
         validate_idempotency_key(idempotency_key)
