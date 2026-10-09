@@ -5,7 +5,21 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from video_agent.models import TaskSummary, TaskView
+from video_agent.models import (
+    ArtifactView,
+    AudioOptions,
+    CreateTaskRequest,
+    InputPatch,
+    PlanChange,
+    PlanPatch,
+    PlanView,
+    ProductInfo,
+    RegenerateRequest,
+    ShotTextPatch,
+    TaskSummary,
+    TaskView,
+    VideoOptions,
+)
 
 POLL_INTERVAL_MS = 1000
 IDLE_SLEEP_SECONDS = 1
@@ -184,4 +198,210 @@ def format_execution(task: TaskView) -> str:
     else:
         shots = f"{task.completed_shots}/{task.total_shots}"
     return f"阶段：{task.stage or ''}\n已完成镜头：{shots}\n阶段说明：{task.stage_detail or ''}"
+
+
+FIRST_FRAME_NONE = "不指定首帧"
+ASPECT_RATIOS = ("9:16", "16:9", "1:1", "4:5", "3:4", "4:3", "3:2", "2:3")
+
+
+@dataclass
+class DemandEdit:
+    name: str
+    category: str
+    selling_points: list[str]
+    specs: str
+    user_prompt: str
+    images: list[str]
+    first_frame_asset_id: str | None
+    duration_seconds: int
+    aspect_ratio: str
+    subtitles: bool
+    voiceover: bool
+    music: bool
+    language: str
+    voice_preference: str
+    music_direction: str
+    music_asset_id: str | None
+
+
+@dataclass
+class PlanEdit:
+    duration_seconds: int
+    aspect_ratio: str
+    fit: str
+    subtitles: bool
+    voiceover: bool
+    music: bool
+    language: str
+    voice_preference: str
+    music_direction: str
+    music_asset_id: str | None
+    clear_music_asset: bool
+    first_frame_asset_id: str | None
+    clear_first_frame: bool
+    shot_texts: list[ShotTextPatch]
+
+
+def parse_selling_points(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _blank_none(value: str) -> str | None:
+    text = value.strip()
+    if text:
+        return text
+    return None
+
+
+def _product(edit: DemandEdit) -> ProductInfo:
+    return ProductInfo(
+        name=_blank_none(edit.name),
+        category=_blank_none(edit.category),
+        selling_points=list(edit.selling_points),
+        specs=_blank_none(edit.specs),
+    )
+
+
+def _video(edit: DemandEdit) -> VideoOptions:
+    return VideoOptions(
+        duration_seconds=edit.duration_seconds,
+        aspect_ratio=edit.aspect_ratio,
+        subtitles=edit.subtitles,
+        voiceover=edit.voiceover,
+        music=edit.music,
+    )
+
+
+def _audio_demand(edit: DemandEdit) -> AudioOptions:
+    return AudioOptions(
+        language=_blank_none(edit.language),
+        voice_preference=edit.voice_preference,
+        music_direction=edit.music_direction,
+        music_asset_id=edit.music_asset_id,
+    )
+
+
+def build_create_request(edit: DemandEdit) -> CreateTaskRequest:
+    return CreateTaskRequest(
+        product_info=_product(edit),
+        images=list(edit.images),
+        first_frame_asset_id=edit.first_frame_asset_id,
+        user_prompt=edit.user_prompt,
+        video_options=_video(edit),
+        audio_options=_audio_demand(edit),
+    )
+
+
+def build_input_patch(edit: DemandEdit, *, images_changed: bool) -> InputPatch:
+    clear_first = edit.first_frame_asset_id is None
+    return InputPatch(
+        product_info=_product(edit),
+        user_prompt=edit.user_prompt,
+        images=list(edit.images) if images_changed else None,
+        first_frame_asset_id=edit.first_frame_asset_id,
+        clear_first_frame=clear_first,
+        video_options=_video(edit),
+        audio_options=_audio_demand(edit),
+    )
+
+
+def build_plan_change(instruction: str, edit: PlanEdit) -> PlanChange:
+    text = instruction.strip()
+    if text:
+        return PlanChange(instruction=text)
+    first_id = None if edit.clear_first_frame else edit.first_frame_asset_id
+    return PlanChange(
+        patch=PlanPatch(
+            duration_seconds=edit.duration_seconds,
+            aspect_ratio=edit.aspect_ratio,
+            fit=edit.fit,
+            subtitles=edit.subtitles,
+            voiceover=edit.voiceover,
+            music=edit.music,
+            language=_blank_none(edit.language),
+            voice_preference=edit.voice_preference,
+            music_direction=edit.music_direction,
+            music_asset_id=None if edit.clear_music_asset else edit.music_asset_id,
+            clear_music_asset=edit.clear_music_asset,
+            first_frame_asset_id=first_id,
+            clear_first_frame=edit.clear_first_frame,
+            shot_texts=list(edit.shot_texts),
+        )
+    )
+
+
+def build_regenerate_full() -> RegenerateRequest:
+    return RegenerateRequest(kind="full")
+
+
+def build_regenerate_shots(artifact_id: str, shot_ids: list[str]) -> RegenerateRequest:
+    return RegenerateRequest(kind="shots", artifact_id=artifact_id, shot_ids=list(shot_ids))
+
+
+def newest_artifact(artifacts: list[ArtifactView]) -> ArtifactView | None:
+    if not artifacts:
+        return None
+    return artifacts[0]
+
+
+def shot_plan_version(artifacts: list[ArtifactView]) -> int | None:
+    artifact = newest_artifact(artifacts)
+    if artifact is None:
+        return None
+    return artifact.plan_version
+
+
+def shot_checkbox_items(plan: PlanView) -> list[tuple[str, str]]:
+    items = []
+    for shot in plan.document.shots:
+        label = f"{shot.shot_id}  {shot.content}  [{shot.start_frame},{shot.end_frame})"
+        items.append((shot.shot_id, label))
+    return items
+
+
+def format_plan(plan: PlanView) -> str:
+    doc = plan.document
+    visual = doc.shared_visual
+    lines = [
+        f"版本 {plan.plan_version}  head={plan.is_head}  已确认={plan.confirmed}  已放弃={plan.abandoned}",
+        f"创意：{doc.creative}",
+        f"受众：{doc.audience}",
+        f"卖点：{'、'.join(doc.selling_points)}",
+        f"产品参考：{visual.product_reference}",
+        f"场景：{visual.scene}",
+        f"光线：{visual.lighting}",
+        f"色调：{visual.palette}",
+        f"风格：{visual.style}",
+        f"人物：{visual.character or ''}",
+        f"换景：{visual.scene_change or ''}",
+        f"首帧来源：{doc.first_frame_source}  素材：{doc.first_frame_asset_id or ''}",
+        f"比例适配：{doc.fit}  字幕：{doc.subtitles}  配音：{doc.voiceover}  音乐：{doc.music}",
+        f"时长：{doc.duration_seconds}  比例：{doc.aspect_ratio}",
+        f"模型能力：{doc.model_capabilities}",
+    ]
+    for shot in doc.shots:
+        lines.append(
+            f"{shot.shot_id}  内容={shot.content}  动作={shot.action}  景别={shot.shot_size}  "
+            f"运镜={shot.camera}  场景={shot.scene_id}  帧=[{shot.start_frame},{shot.end_frame})"
+        )
+    return "\n".join(lines)
+
+
+def format_artifact(artifact: ArtifactView) -> str:
+    return (
+        f"v{artifact.version}  {artifact.duration_seconds}s  "
+        f"{artifact.width}×{artifact.height}  {artifact.aspect_ratio}  "
+        f"质量={artifact.quality_status}  {artifact.artifact_id}"
+    )
+
+
+def first_frame_label(name: str, asset_id: str) -> str:
+    return f"{name} | {asset_id}"
+
+
+def first_frame_asset_id(label: str) -> str | None:
+    if label == FIRST_FRAME_NONE or " | " not in label:
+        return None
+    return label.split(" | ", 1)[1]
+
 

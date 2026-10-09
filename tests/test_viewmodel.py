@@ -236,3 +236,208 @@ def test_window_title_and_region_copy():
     assert "generating_shots" in text
     assert "0/1" in text
     assert "正在生成第 1 镜" in text
+
+
+def _document(shot_ids=("s1",)):
+    from video_agent.models import PlanDocument, SharedVisual, ShotPlan
+
+    shots = []
+    frame = 0
+    for shot_id in shot_ids:
+        shots.append(
+            ShotPlan(
+                shot_id=shot_id,
+                content=f"{shot_id}内容",
+                action="转动",
+                shot_size="中景",
+                camera="固定",
+                scene_id="scene-a",
+                start_frame=frame,
+                end_frame=frame + 150,
+                subtitle_text="字幕",
+                voiceover_text="配音",
+            )
+        )
+        frame += 150
+    return PlanDocument(
+        creative="厨房里的玻璃杯",
+        audience="家庭",
+        selling_points=["耐热"],
+        shared_visual=SharedVisual(
+            product_reference="透明杯",
+            scene="厨房台面",
+            lighting="白天",
+            palette="浅色",
+            style="写实",
+        ),
+        shots=shots,
+        duration_seconds=10,
+        aspect_ratio="9:16",
+        fit="native",
+        subtitles=True,
+        voiceover=True,
+        music=True,
+        first_frame_source="selected",
+        first_frame_asset_id="img-1",
+        model_capabilities="9:16 原生",
+    )
+
+
+def _plan(version: int, shot_ids=("s1",)):
+    from video_agent.models import PlanView
+
+    return PlanView(
+        task_id="task-1",
+        plan_version=version,
+        is_head=True,
+        confirmed=False,
+        abandoned=False,
+        document=_document(shot_ids),
+    )
+
+
+def _artifact(plan_version: int, version: int):
+    from video_agent.models import ArtifactView
+
+    return ArtifactView(
+        artifact_id=f"art-{version}",
+        task_id="task-1",
+        generation_id=f"gen-{version}",
+        plan_version=plan_version,
+        version=version,
+        duration_seconds=10,
+        aspect_ratio="9:16",
+        width=1080,
+        height=1920,
+        quality_status="not_assessed",
+        quality={"reason": "visual adapter is none"},
+        created_at="2026-10-09T00:00:00+00:00",
+    )
+
+
+def _demand(**kwargs):
+    from desktop_app.viewmodel import DemandEdit
+
+    base = dict(
+        name="玻璃杯",
+        category="家居",
+        selling_points=["耐热", "透明"],
+        specs="300ml",
+        user_prompt="厨房台面，白天",
+        images=["img-1"],
+        first_frame_asset_id="img-1",
+        duration_seconds=10,
+        aspect_ratio="9:16",
+        subtitles=True,
+        voiceover=True,
+        music=False,
+        language="中文",
+        voice_preference="平稳",
+        music_direction="",
+        music_asset_id=None,
+    )
+    base.update(kwargs)
+    return DemandEdit(**base)
+
+
+def _plan_edit(**kwargs):
+    from desktop_app.viewmodel import PlanEdit
+    from video_agent.models import ShotTextPatch
+
+    base = dict(
+        duration_seconds=15,
+        aspect_ratio="16:9",
+        fit="pad",
+        subtitles=True,
+        voiceover=False,
+        music=True,
+        language="中文",
+        voice_preference="",
+        music_direction="轻快",
+        music_asset_id=None,
+        clear_music_asset=False,
+        first_frame_asset_id="img-1",
+        clear_first_frame=False,
+        shot_texts=[ShotTextPatch(shot_id="s1", content="杯口特写")],
+    )
+    base.update(kwargs)
+    return PlanEdit(**base)
+
+
+def test_create_request_sends_fields_prompt_and_optional_first_frame():
+    from desktop_app.viewmodel import FIRST_FRAME_NONE, build_create_request, first_frame_asset_id
+
+    request = build_create_request(_demand())
+    assert request.product_info.name == "玻璃杯"
+    assert request.product_info.selling_points == ["耐热", "透明"]
+    assert request.user_prompt == "厨房台面，白天"
+    assert request.images == ["img-1"]
+    assert request.first_frame_asset_id == "img-1"
+    assert request.video_options.duration_seconds == 10
+    assert request.video_options.music is False
+    assert request.audio_options.language == "中文"
+    omitted = build_create_request(_demand(first_frame_asset_id=None, images=[]))
+    assert omitted.first_frame_asset_id is None
+    assert omitted.images == []
+    assert first_frame_asset_id(FIRST_FRAME_NONE) is None
+
+
+def test_blank_instruction_submits_patch_and_text_submits_only_instruction():
+    from desktop_app.viewmodel import build_plan_change
+
+    spoken = build_plan_change("  把镜头改成手持特写  ", _plan_edit())
+    assert spoken.instruction == "把镜头改成手持特写"
+    assert spoken.patch is None
+
+    silent = build_plan_change("   ", _plan_edit(clear_first_frame=True, first_frame_asset_id=None))
+    assert silent.instruction is None
+    assert silent.patch is not None
+    assert silent.patch.duration_seconds == 15
+    assert silent.patch.aspect_ratio == "16:9"
+    assert silent.patch.fit == "pad"
+    assert silent.patch.shots is None
+    assert silent.patch.shot_texts[0].content == "杯口特写"
+    assert silent.patch.clear_first_frame is True
+    assert silent.patch.first_frame_asset_id is None
+
+
+def test_input_patch_omits_images_until_the_user_picks_again():
+    from desktop_app.viewmodel import build_input_patch
+
+    kept = build_input_patch(_demand(), images_changed=False)
+    assert kept.images is None
+    assert kept.user_prompt == "厨房台面，白天"
+    changed = build_input_patch(_demand(images=[], first_frame_asset_id=None), images_changed=True)
+    assert changed.images == []
+    assert changed.clear_first_frame is True
+
+
+def test_shot_choices_come_from_newest_artifact_plan():
+    from desktop_app.viewmodel import build_regenerate_full, build_regenerate_shots, shot_checkbox_items, shot_plan_version
+
+    artifacts = [_artifact(plan_version=4, version=2), _artifact(plan_version=2, version=1)]
+    assert shot_plan_version(artifacts) == 4
+    assert shot_plan_version([]) is None
+    labels = shot_checkbox_items(_plan(4, ("s1", "s2")))
+    assert [item[0] for item in labels] == ["s1", "s2"]
+    assert "s1内容" in labels[0][1]
+    partial = build_regenerate_shots("art-2", ["s1", "s2"])
+    assert partial.kind == "shots"
+    assert partial.artifact_id == "art-2"
+    assert partial.shot_ids == ["s1", "s2"]
+    assert build_regenerate_full().kind == "full"
+    assert build_regenerate_full().shot_ids == []
+
+
+def test_plan_and_artifact_text_include_contract_fields():
+    from desktop_app.viewmodel import format_artifact, format_plan, parse_selling_points
+
+    text = format_plan(_plan(3))
+    for piece in ("厨房里的玻璃杯", "透明杯", "厨房台面", "白天", "浅色", "写实", "s1", "中景", "固定", "scene-a", "[0,150)", "selected", "native"):
+        assert piece in text
+    line = format_artifact(_artifact(3, 2))
+    assert "v2" in line
+    assert "10s" in line
+    assert "1080×1920" in line
+    assert "not_assessed" in line
+    assert parse_selling_points(" 耐热 \n\n透明\n") == ["耐热", "透明"]
