@@ -73,10 +73,6 @@ def _sync_config_without_external_id(agent, work: dict) -> None:
                WHERE generation_id=? AND external_task_id IS NOT NULL LIMIT 1""",
             (work["generation_id"],),
         ).fetchone()
-        conn.execute(
-            "DELETE FROM work_items WHERE task_id=? AND kind='planning' AND done=1",
-            (work["task_id"],),
-        )
         if external is not None:
             return
         conn.execute(

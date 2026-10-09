@@ -28,7 +28,7 @@ def _generation_id(agent, task_id: str) -> str:
 
 def _config_row(agent, task_id: str, column: str) -> dict:
     if column == "work":
-        sql = "SELECT copied_config_json FROM work_items WHERE task_id=? ORDER BY ready_at DESC LIMIT 1"
+        sql = "SELECT copied_config_json FROM work_items WHERE task_id=? AND kind='generation' ORDER BY ready_at DESC LIMIT 1"
     else:
         sql = "SELECT copied_config_json FROM generations WHERE task_id=? ORDER BY created_at DESC LIMIT 1"
     raw = read_rows(agent.home, sql, (task_id,))[0]["copied_config_json"]
