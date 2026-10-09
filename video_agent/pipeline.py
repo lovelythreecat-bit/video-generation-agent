@@ -3,15 +3,30 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import uuid
 from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
 
 from video_agent.errors import VideoAgentError
 from video_agent.lease import hold_lease
-from video_agent.media import _run_ffmpeg, fit_image, probe
+from video_agent.media import (
+    _atempo_pad,
+    _concat_audio,
+    _frame_rate,
+    _pixel_format,
+    _run_ffmpeg,
+    _silence,
+    burn_subtitles,
+    concat_clips,
+    extract_png,
+    fit_image,
+    mix_audio,
+    probe,
+    trim_or_loop_audio,
+)
 from video_agent.models import PlanDocument, ShotPlan
-from video_agent.ports import ShotRequest
+from video_agent.ports import CheckFrame, ShotRequest, VisualResult, VoiceCue
 
 _STAGE = {
     "first_frame": "preparing_first_frame",
@@ -58,6 +73,18 @@ def _dispatch(agent, work: dict, step: str) -> None:
         return
     if step == "import_shot":
         _step_import_shot(agent, work)
+        return
+    if step == "audio":
+        _step_audio(agent, work)
+        return
+    if step == "compose":
+        _step_compose(agent, work)
+        return
+    if step == "visual":
+        _step_visual(agent, work)
+        return
+    if step == "export":
+        _step_export(agent, work)
         return
     raise VideoAgentError(
         "MEDIA_EXPORT_FAILED",
@@ -528,3 +555,318 @@ def _prompt(document: PlanDocument, shot: ShotPlan) -> str:
             shot.camera,
         ]
     )
+
+
+def _step_audio(agent, work: dict) -> None:
+    _enter(agent, work, "audio")
+    generation = _require_generation(agent, work["generation_id"])
+    document = PlanDocument.model_validate_json(generation["snapshot_json"])
+    if not document.voiceover and not document.music:
+        _advance(agent, work, "compose")
+        return
+    if document.voiceover and agent.voice is None:
+        raise VideoAgentError(
+            "PROVIDER_REJECTED",
+            "配音已开启，但没有可用的配音实现",
+            stage="preparing_audio",
+            retryable=True,
+        )
+    root = _gen_dir(agent, work)
+    bitrate = int(agent.config.audio_bitrate)
+    if document.voiceover:
+        _build_voice(agent, work, document, root, bitrate)
+    if document.music:
+        _build_music(agent, work, document, root, bitrate)
+    _advance(agent, work, "compose")
+
+
+def _build_voice(agent, work: dict, document: PlanDocument, root: Path, audio_bitrate: int) -> None:
+    pieces: list[Path] = []
+    cues: list[VoiceCue] = []
+    for shot in document.shots:
+        window_ms = (shot.end_frame - shot.start_frame) * 1000 // 30
+        window_seconds = window_ms / 1000
+        segment = root / f"voice-{shot.shot_id}.m4a"
+        if window_ms <= 0:
+            raise VideoAgentError("MEDIA_EXPORT_FAILED", "镜头帧区间为空", stage="preparing_audio", retryable=True, shot_ids=[shot.shot_id])
+        if not shot.voiceover_text.strip():
+            _silence(window_seconds, segment, audio_bitrate)
+            pieces.append(segment)
+            continue
+        with hold_lease(agent.db, work["work_id"], agent.worker_owner, agent.clock, int(agent.config.lease_seconds)):
+            result = agent.voice.synthesize(
+                text=shot.voiceover_text,
+                language=document.language,
+                preference=document.voice_preference,
+            )
+        speed = 1.0
+        if result.duration_ms > window_ms:
+            speed = result.duration_ms / window_ms
+        if speed > 2.0:
+            raise VideoAgentError(
+                "VOICEOVER_DOES_NOT_FIT",
+                "配音文案放不进已确认时长",
+                stage="preparing_audio",
+                retryable=False,
+                shot_ids=[shot.shot_id],
+            )
+        raw = root / f"voice-{shot.shot_id}.raw.m4a"
+        raw.write_bytes(result.audio)
+        _atempo_pad(raw, speed, window_seconds, segment, audio_bitrate)
+        offset = shot.start_frame * 1000 // 30
+        window_end = shot.end_frame * 1000 // 30
+        for cue in result.cues:
+            start = min(max(int(cue.start_ms / speed) + offset, offset), window_end)
+            end = min(max(int(cue.end_ms / speed) + offset, start + 1), window_end)
+            cues.append(VoiceCue(text=cue.text, start_ms=start, end_ms=end))
+        pieces.append(segment)
+    _concat_audio(pieces, root / "voice.m4a", audio_bitrate)
+    (root / "cues.json").write_text(
+        json.dumps([cue.model_dump() for cue in cues], ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _build_music(agent, work: dict, document: PlanDocument, root: Path, audio_bitrate: int) -> None:
+    dest = root / "music.m4a"
+    if document.music_asset_id:
+        source = _asset_path(agent, document.music_asset_id, "preparing_audio")
+        trim_or_loop_audio(source, float(document.duration_seconds), dest, audio_bitrate=audio_bitrate)
+        return
+    if agent.music is None:
+        raise VideoAgentError(
+            "PROVIDER_REJECTED",
+            "音乐已开启，但没有可用的音乐实现或已登记音频",
+            stage="preparing_audio",
+            retryable=True,
+        )
+    with hold_lease(agent.db, work["work_id"], agent.worker_owner, agent.clock, int(agent.config.lease_seconds)):
+        data = agent.music.generate(direction=document.music_direction, duration_seconds=float(document.duration_seconds))
+    raw = root / "music.raw.m4a"
+    raw.write_bytes(data)
+    trim_or_loop_audio(raw, float(document.duration_seconds), dest, audio_bitrate=audio_bitrate)
+
+
+def _step_compose(agent, work: dict) -> None:
+    _enter(agent, work, "compose")
+    generation = _require_generation(agent, work["generation_id"])
+    document = PlanDocument.model_validate_json(generation["snapshot_json"])
+    clips: list[Path] = []
+    with _transaction(agent) as conn:
+        rows = conn.execute(
+            """SELECT shot_id, status, clip_path FROM generation_shots
+               WHERE generation_id=? ORDER BY ordinal""",
+            (work["generation_id"],),
+        ).fetchall()
+    for shot_id, status, clip_path in rows:
+        if status != "imported" or not clip_path:
+            raise VideoAgentError("MEDIA_EXPORT_FAILED", "镜头片段尚未导入", stage="composing", retryable=True, shot_ids=[shot_id])
+        clips.append(agent.files.path_for(clip_path))
+    dest = _gen_dir(agent, work) / "composed.mp4"
+    concat_clips(clips, dest)
+    info = probe(dest)
+    if info.frame_count != document.duration_seconds * 30 or info.has_audio:
+        raise VideoAgentError(
+            "MEDIA_EXPORT_FAILED",
+            "拼接后的帧数或音轨不符合无字幕画面",
+            stage="composing",
+            retryable=True,
+        )
+    _advance(agent, work, "visual")
+
+
+def _step_visual(agent, work: dict) -> None:
+    _enter(agent, work, "visual")
+    generation = _require_generation(agent, work["generation_id"])
+    document = PlanDocument.model_validate_json(generation["snapshot_json"])
+    root = _gen_dir(agent, work)
+    composed = root / "composed.mp4"
+    frames: list[CheckFrame] = []
+    for index, shot in enumerate(document.shots):
+        positions = {
+            "start": shot.start_frame,
+            "middle": (shot.start_frame + shot.end_frame - 1) // 2,
+            "end": shot.end_frame - 1,
+        }
+        for position, frame_index in positions.items():
+            dest = root / "frames" / f"{shot.shot_id}-{position}.png"
+            extract_png(composed, frame_index, dest)
+            frames.append(CheckFrame(shot_id=shot.shot_id, position=position, path=dest))
+        if index > 0:
+            dest = root / "frames" / f"{shot.shot_id}-boundary.png"
+            extract_png(composed, shot.start_frame, dest)
+            frames.append(CheckFrame(shot_id=shot.shot_id, position="boundary", path=dest))
+    if agent.visual is None:
+        result = VisualResult(status="not_assessed", reason="visual adapter is none")
+    else:
+        try:
+            result = agent.visual.check(frames, _appearance(document))
+        except Exception as exc:
+            result = VisualResult(status="not_assessed", reason=str(exc))
+    if result.status not in {"passed", "flagged", "not_assessed"}:
+        result = VisualResult(status="not_assessed", reason="视觉检查结果无法识别")
+    (root / "quality.json").write_text(result.model_dump_json(), encoding="utf-8")
+    _advance(agent, work, "export")
+
+
+def _step_export(agent, work: dict) -> None:
+    _enter(agent, work, "export")
+    generation = _require_generation(agent, work["generation_id"])
+    document = PlanDocument.model_validate_json(generation["snapshot_json"])
+    root = _gen_dir(agent, work)
+    width, height = _canvas(agent, document.aspect_ratio)
+    video_bitrate = int(agent.config.video_bitrate)
+    audio_bitrate = int(agent.config.audio_bitrate)
+    picture = root / "composed.mp4"
+    voice_cues = _read_cues(root / "cues.json")
+    if document.subtitles:
+        burned = root / "subtitled.mp4"
+        burn_subtitles(
+            picture,
+            _subtitle_cues(document, voice_cues if document.voiceover else None),
+            width,
+            height,
+            burned,
+            video_bitrate=video_bitrate,
+        )
+        picture = burned
+    voice = root / "voice.m4a" if document.voiceover else None
+    music = root / "music.m4a" if document.music else None
+    tmp = root / "final.tmp.mp4"
+    try:
+        with hold_lease(agent.db, work["work_id"], agent.worker_owner, agent.clock, int(agent.config.lease_seconds)):
+            mix_audio(
+                picture,
+                voice if voice is not None and voice.is_file() else None,
+                music if music is not None and music.is_file() else None,
+                voice_cues if document.voiceover and document.music else [],
+                tmp,
+                video_bitrate=video_bitrate,
+                audio_bitrate=audio_bitrate,
+            )
+        _assert_final(tmp, document, agent)
+    except Exception:
+        if tmp.is_file():
+            tmp.unlink()
+        raise
+    final = root / "final.mp4"
+    os.replace(tmp, final)
+    _register_artifact(agent, work, generation, document, final)
+
+
+def _assert_final(path: Path, document: PlanDocument, agent) -> None:
+    info = probe(path)
+    width, height = _canvas(agent, document.aspect_ratio)
+    expected = document.duration_seconds * 30
+    if info.frame_count != expected or info.width != width or info.height != height:
+        raise VideoAgentError("MEDIA_EXPORT_FAILED", "成片帧数或尺寸不符合已确认方案", stage="exporting", retryable=True)
+    if info.video_codec != "h264" or _pixel_format(path) != "yuv420p" or abs(_frame_rate(path) - 30) > 0.05:
+        raise VideoAgentError("MEDIA_EXPORT_FAILED", "成片编码或帧率不符合要求", stage="exporting", retryable=True)
+    want_audio = bool(document.voiceover or document.music)
+    if info.has_audio != want_audio:
+        raise VideoAgentError("MEDIA_EXPORT_FAILED", "成片音轨与开关不一致", stage="exporting", retryable=True)
+    if want_audio and info.audio_codec != "aac":
+        raise VideoAgentError("MEDIA_EXPORT_FAILED", "成片音轨不是 AAC", stage="exporting", retryable=True)
+
+
+def _register_artifact(agent, work: dict, generation: dict, document: PlanDocument, final: Path) -> None:
+    root = final.parent
+    if (root / "quality.json").is_file():
+        quality = VisualResult.model_validate_json((root / "quality.json").read_text(encoding="utf-8"))
+    else:
+        quality = VisualResult(status="not_assessed", reason="缺少视觉检查结果")
+    now = agent.clock.now().isoformat()
+    relative = f"tasks/{work['task_id']}/generations/{work['generation_id']}/final.mp4"
+    width, height = _canvas(agent, document.aspect_ratio)
+    with _transaction(agent) as conn:
+        current = _one(conn, "SELECT COALESCE(MAX(version), 0) AS version FROM artifacts WHERE task_id=?", (work["task_id"],))
+        version = int(current["version"]) + 1
+        conn.execute(
+            """INSERT INTO artifacts (
+                artifact_id, task_id, generation_id, plan_version, version, duration_seconds,
+                aspect_ratio, width, height, relative_path, quality_status, quality_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                str(uuid.uuid4()),
+                work["task_id"],
+                work["generation_id"],
+                int(generation["plan_version"]),
+                version,
+                document.duration_seconds,
+                document.aspect_ratio,
+                width,
+                height,
+                relative,
+                quality.status,
+                quality.model_dump_json(),
+                now,
+            ),
+        )
+        conn.execute(
+            """UPDATE generations
+               SET status='succeeded', stage='exporting', stage_detail='成片已导出',
+                   failure_code=NULL, failure_message=NULL, failure_stage=NULL,
+                   failure_retryable=NULL, failure_details_json=NULL, updated_at=?
+               WHERE generation_id=?""",
+            (now, work["generation_id"]),
+        )
+        task = _one(
+            conn,
+            "SELECT head_plan_version, confirmed_plan_version FROM tasks WHERE task_id=?",
+            (work["task_id"],),
+        )
+        plan_version = int(generation["plan_version"])
+        if task["head_plan_version"] == plan_version and task["confirmed_plan_version"] == plan_version:
+            status = "succeeded"
+        else:
+            status = "awaiting_confirmation"
+        conn.execute(
+            """UPDATE tasks
+               SET status=?, stage=NULL, stage_detail=NULL, failure_scope=NULL,
+                   failure_code=NULL, failure_message=NULL, failure_stage=NULL,
+                   failure_retryable=NULL, failure_details_json=NULL,
+                   completed_shots=NULL, total_shots=NULL, updated_at=?
+               WHERE task_id=?""",
+            (status, now, work["task_id"]),
+        )
+        conn.execute(
+            """UPDATE work_items
+               SET done=1, lease_owner=NULL, lease_until=NULL, next_attempt_at=NULL
+               WHERE work_id=?""",
+            (work["work_id"],),
+        )
+
+
+def _subtitle_cues(document: PlanDocument, voice_cues: list[VoiceCue] | None) -> list[VoiceCue]:
+    cues: list[VoiceCue] = []
+    for shot in document.shots:
+        if not shot.subtitle_text.strip():
+            continue
+        window_start = shot.start_frame * 1000 // 30
+        window_end = shot.end_frame * 1000 // 30
+        if not voice_cues:
+            cues.append(VoiceCue(text=shot.subtitle_text, start_ms=window_start, end_ms=window_end))
+            continue
+        inside = [cue for cue in voice_cues if cue.end_ms > window_start and cue.start_ms < window_end]
+        if not inside:
+            cues.append(VoiceCue(text=shot.subtitle_text, start_ms=window_start, end_ms=window_end))
+            continue
+        start = max(window_start, min(cue.start_ms for cue in inside))
+        end = min(window_end, max(cue.end_ms for cue in inside))
+        if end <= start:
+            end = window_end
+        cues.append(VoiceCue(text=shot.subtitle_text, start_ms=start, end_ms=end))
+    return cues
+
+
+def _read_cues(path: Path) -> list[VoiceCue]:
+    if not path.is_file():
+        return []
+    return [VoiceCue.model_validate(item) for item in json.loads(path.read_text(encoding="utf-8"))]
+
+
+def _appearance(document: PlanDocument) -> str:
+    visual = document.shared_visual
+    parts = [visual.product_reference, visual.character or "", visual.scene, visual.lighting, visual.palette, visual.style]
+    return "\n".join(part for part in parts if part)
+
