@@ -98,6 +98,8 @@ def _step_first_frame(agent, work: dict) -> None:
     generation = _require_generation(agent, work["generation_id"])
     document = PlanDocument.model_validate_json(generation["snapshot_json"])
     _ensure_shots(agent, work["generation_id"], document)
+    if generation["kind"] == "shots":
+        _reuse_base_shots(agent, work, generation, document)
     _enter(agent, work, "first_frame")
     if document.first_frame_source != "selected" or not document.first_frame_asset_id:
         raise VideoAgentError(
@@ -110,9 +112,12 @@ def _step_first_frame(agent, work: dict) -> None:
     root = _gen_dir(agent, work)
     root.mkdir(parents=True, exist_ok=True)
     copied = root / f"first_frame{source.suffix.lower() or '.png'}"
-    shutil.copyfile(source, copied)
+    if not copied.is_file():
+        shutil.copyfile(source, copied)
     width, height = _canvas(agent, document.aspect_ratio)
-    fit_image(copied, document.fit, width, height, root / "first_frame_fitted.png")
+    fitted = root / "first_frame_fitted.png"
+    if not fitted.is_file():
+        fit_image(copied, document.fit, width, height, fitted)
     _advance(agent, work, "submit_shot")
 
 
@@ -138,7 +143,7 @@ def _enter(agent, work: dict, step: str) -> None:
     now = agent.clock.now().isoformat()
     with _transaction(agent) as conn:
         total = conn.execute(
-            "SELECT COUNT(*) FROM generation_shots WHERE generation_id=?",
+            "SELECT COUNT(*) FROM generation_shots WHERE generation_id=? AND status!='reused'",
             (work["generation_id"],),
         ).fetchone()[0]
         done = conn.execute(
@@ -442,16 +447,18 @@ def _shot_request(agent, work: dict, shot: dict, document: PlanDocument) -> Shot
     plan_shot = _plan_shot(document, shot["shot_id"])
     width, height = _canvas(agent, document.aspect_ratio)
     references = [_asset_path(agent, asset_id, "generating_shots") for asset_id in _image_ids(agent, work["task_id"])]
-    fitted = _gen_dir(agent, work) / "first_frame_fitted.png"
+    generation = _require_generation(agent, work["generation_id"])
+    first_path, tail_path, extras = _neighbor_media(agent, work, generation, document, shot)
+    references.extend(extras)
     key = shot["provider_idempotency_key"] or f"{work['generation_id']}:{shot['shot_id']}"
     return ShotRequest(
         generation_id=work["generation_id"],
         shot_id=shot["shot_id"],
         prompt=_prompt(document, plan_shot),
         shared_visual=document.shared_visual,
-        first_frame_path=fitted if fitted.is_file() else None,
+        first_frame_path=first_path,
         reference_paths=references,
-        tail_frame_path=None,
+        tail_frame_path=tail_path,
         frame_count=int(shot["end_frame"]) - int(shot["start_frame"]),
         aspect_ratio=document.aspect_ratio,
         fit=document.fit,
@@ -663,7 +670,7 @@ def _step_compose(agent, work: dict) -> None:
             (work["generation_id"],),
         ).fetchall()
     for shot_id, status, clip_path in rows:
-        if status != "imported" or not clip_path:
+        if status not in {"imported", "reused"} or not clip_path:
             raise VideoAgentError("MEDIA_EXPORT_FAILED", "镜头片段尚未导入", stage="composing", retryable=True, shot_ids=[shot_id])
         clips.append(agent.files.path_for(clip_path))
     dest = _gen_dir(agent, work) / "composed.mp4"
@@ -909,4 +916,94 @@ def _copy_base_audio(agent, generation: dict, root: Path, document: PlanDocument
         raise VideoAgentError("MEDIA_EXPORT_FAILED", "基础音乐不存在", stage="preparing_audio", retryable=True)
     if document.subtitles and document.voiceover and not (root / "cues.json").is_file():
         raise VideoAgentError("MEDIA_EXPORT_FAILED", "基础字幕时间不存在", stage="preparing_audio", retryable=True)
+
+
+def _reuse_base_shots(agent, work: dict, generation: dict, document: PlanDocument) -> None:
+    base = _base_generation_dir(agent, generation)
+    if base is None:
+        raise VideoAgentError("MEDIA_EXPORT_FAILED", "找不到基础成品的执行目录", stage="preparing_first_frame", retryable=True)
+    root = _gen_dir(agent, work)
+    (root / "shots").mkdir(parents=True, exist_ok=True)
+    with _transaction(agent) as conn:
+        existing = {
+            row[0]
+            for row in conn.execute(
+                "SELECT shot_id FROM generation_shots WHERE generation_id=?",
+                (generation["generation_id"],),
+            )
+        }
+        for index, shot in enumerate(document.shots):
+            if shot.shot_id in existing:
+                conn.execute(
+                    "UPDATE generation_shots SET ordinal=? WHERE generation_id=? AND shot_id=?",
+                    (index, generation["generation_id"], shot.shot_id),
+                )
+                continue
+            source = base / "shots" / f"{shot.shot_id}.mp4"
+            if not source.is_file():
+                raise VideoAgentError(
+                    "MEDIA_EXPORT_FAILED",
+                    "基础镜头片段不存在",
+                    stage="preparing_first_frame",
+                    retryable=True,
+                    shot_ids=[shot.shot_id],
+                )
+            dest = root / "shots" / f"{shot.shot_id}.mp4"
+            if not dest.is_file():
+                shutil.copyfile(source, dest)
+            relative = dest.relative_to(agent.files.home).as_posix()
+            conn.execute(
+                """INSERT INTO generation_shots (
+                    generation_id, shot_id, ordinal, start_frame, end_frame, status, clip_path
+                ) VALUES (?, ?, ?, ?, ?, 'reused', ?)""",
+                (generation["generation_id"], shot.shot_id, index, shot.start_frame, shot.end_frame, relative),
+            )
+
+
+def _replacing_ids(generation: dict, document: PlanDocument) -> set[str]:
+    if generation["kind"] == "full":
+        return {shot.shot_id for shot in document.shots}
+    return set(json.loads(generation["shot_ids_json"]))
+
+
+def _neighbor_media(agent, work: dict, generation: dict, document: PlanDocument, shot_row: dict):
+    plan_shots = list(document.shots)
+    index = next(position for position, item in enumerate(plan_shots) if item.shot_id == shot_row["shot_id"])
+    replacing = _replacing_ids(generation, document)
+    fitted = _gen_dir(agent, work) / "first_frame_fitted.png"
+    first_path = fitted if fitted.is_file() and (len(plan_shots) == 1 or index == 0) else None
+    tail_path = None
+    if len(plan_shots) > 1 and index > 0:
+        left = plan_shots[index - 1]
+        if left.shot_id in replacing:
+            clip = _gen_dir(agent, work) / "shots" / f"{left.shot_id}.mp4"
+        else:
+            base = _base_generation_dir(agent, generation)
+            clip = None if base is None else base / "shots" / f"{left.shot_id}.mp4"
+        if clip is None or not clip.is_file():
+            raise VideoAgentError("MEDIA_EXPORT_FAILED", "左侧相邻镜头片段不存在", stage="generating_shots", retryable=True, shot_ids=[left.shot_id])
+        dest = _gen_dir(agent, work) / "frames" / f"{left.shot_id}-taken-end.png"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        extract_png(clip, probe(clip).frame_count - 1, dest)
+        first_path = dest
+    if len(plan_shots) > 1 and index + 1 < len(plan_shots):
+        right = plan_shots[index + 1]
+        if right.shot_id not in replacing:
+            base = _base_generation_dir(agent, generation)
+            clip = None if base is None else base / "shots" / f"{right.shot_id}.mp4"
+            if clip is None or not clip.is_file():
+                raise VideoAgentError("MEDIA_EXPORT_FAILED", "右侧相邻镜头片段不存在", stage="generating_shots", retryable=True, shot_ids=[right.shot_id])
+            dest = _gen_dir(agent, work) / "frames" / f"{right.shot_id}-taken-start.png"
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            extract_png(clip, 0, dest)
+            tail_path = dest
+    extras: list[Path] = []
+    caps = agent.video.capabilities()
+    if first_path is not None and not caps.supports_first_frame:
+        extras.append(first_path)
+        first_path = fitted if index == 0 and fitted.is_file() else None
+    if tail_path is not None and not caps.supports_tail_frame:
+        extras.append(tail_path)
+        tail_path = None
+    return first_path, tail_path, extras
 
