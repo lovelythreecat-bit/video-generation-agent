@@ -10,9 +10,11 @@ from video_agent.db import Database
 from video_agent.errors import VideoAgentError
 from video_agent.files import LocalFileStore
 from video_agent.idempotency import (
+    confirm_payload,
     create_task_payload,
     discard_revision_payload,
     lookup_replay,
+    regenerate_payload,
     revise_plan_payload,
     store_replay,
     submit_inputs_payload,
@@ -24,6 +26,7 @@ from video_agent.models import (
     InputPatch,
     PlanChange,
     ProductInfo,
+    RegenerateRequest,
     TaskView,
     VideoOptions,
 )
@@ -37,6 +40,7 @@ from video_agent.state import (
     publish_document,
     read_task_row,
     read_task_view,
+    start_generation,
 )
 
 
@@ -366,6 +370,115 @@ class VideoAgent:
             )
             view = read_task_view(conn, task_id)
             store_replay(conn, method="discard_revision", key=idempotency_key, payload=payload, task_id=task_id, view=view, now=now)
+            return view
+
+    def confirm(self, task_id: str, plan_version: int, *, idempotency_key: str | None = None) -> TaskView:
+        validate_idempotency_key(idempotency_key)
+        config = self._refresh_config()
+        payload = confirm_payload(task_id, plan_version)
+        now = self.clock.now().isoformat()
+        with self.db.transaction() as conn:
+            replay = lookup_replay(conn, "confirm", idempotency_key, payload)
+            if replay is not None:
+                return replay
+            task = read_task_row(conn, task_id)
+            if task["confirmed_plan_version"] == plan_version and task["head_plan_version"] == plan_version:
+                existing = conn.execute(
+                    """SELECT generation_id FROM generations
+                       WHERE task_id=? AND plan_version=?
+                       ORDER BY created_at ASC, generation_id ASC LIMIT 1""",
+                    (task_id, plan_version),
+                ).fetchone()
+                raise VideoAgentError(
+                    "STATE_CONFLICT",
+                    "该方案版本已经确认",
+                    task_id=task_id,
+                    generation_id=None if existing is None else existing["generation_id"],
+                    plan_version=plan_version,
+                )
+            if task["status"] in {"pending", "planning", "generating"}:
+                raise VideoAgentError("STATE_CONFLICT", "当前状态不允许该操作", task_id=task_id, generation_id=task["generation_id"])
+            version_row = conn.execute(
+                "SELECT abandoned FROM plan_versions WHERE task_id=? AND plan_version=?",
+                (task_id, plan_version),
+            ).fetchone()
+            head = task["head_plan_version"]
+            if version_row is None or version_row["abandoned"] == 1 or plan_version != head:
+                raise VideoAgentError(
+                    "PLAN_VERSION_CONFLICT",
+                    "只能确认当前尚未确认的 head",
+                    task_id=task_id,
+                    plan_version=plan_version,
+                    details={"head_plan_version": head},
+                )
+            assert_mutation_allowed(task, "confirm", has_plan=True)
+            document = load_plan_document(conn, task_id, plan_version)
+            start_generation(
+                conn,
+                task_id=task_id,
+                plan_version=plan_version,
+                kind="full",
+                document=document,
+                selected_shot_ids=[shot.shot_id for shot in document.shots],
+                base_artifact_id=None,
+                copied_config=snapshot_config(config),
+                now=now,
+                confirm_version=plan_version,
+            )
+            view = read_task_view(conn, task_id)
+            store_replay(conn, method="confirm", key=idempotency_key, payload=payload, task_id=task_id, view=view, now=now)
+            return view
+
+    def regenerate(self, task_id: str, request: RegenerateRequest, *, idempotency_key: str | None = None) -> TaskView:
+        validate_idempotency_key(idempotency_key)
+        config = self._refresh_config()
+        payload = regenerate_payload(task_id, request)
+        now = self.clock.now().isoformat()
+        with self.db.transaction() as conn:
+            replay = lookup_replay(conn, "regenerate", idempotency_key, payload)
+            if replay is not None:
+                return replay
+            task = read_task_row(conn, task_id)
+            assert_mutation_allowed(task, "regenerate", has_plan=has_plan(conn, task_id))
+            confirmed_version = int(task["confirmed_plan_version"])
+            if request.kind == "full":
+                document = load_plan_document(conn, task_id, confirmed_version)
+                start_generation(
+                    conn,
+                    task_id=task_id,
+                    plan_version=confirmed_version,
+                    kind="full",
+                    document=document,
+                    selected_shot_ids=[shot.shot_id for shot in document.shots],
+                    base_artifact_id=None,
+                    copied_config=snapshot_config(config),
+                    now=now,
+                    confirm_version=None,
+                )
+            else:
+                if request.artifact_id is None or len(request.shot_ids) == 0:
+                    raise VideoAgentError("VALIDATION_ERROR", "局部重生成需要基础成品和至少一个镜头", fields=["artifact_id", "shot_ids"])
+                artifact = conn.execute("SELECT * FROM artifacts WHERE artifact_id=?", (request.artifact_id,)).fetchone()
+                if artifact is None or artifact["task_id"] != task_id:
+                    raise VideoAgentError("VALIDATION_ERROR", "找不到基础成品", fields=["artifact_id"])
+                document = load_plan_document(conn, task_id, int(artifact["plan_version"]))
+                known = {shot.shot_id for shot in document.shots}
+                if len(set(request.shot_ids)) != len(request.shot_ids) or any(shot_id not in known for shot_id in request.shot_ids):
+                    raise VideoAgentError("VALIDATION_ERROR", "镜头标识不属于该成品", fields=["shot_ids"], shot_ids=list(request.shot_ids))
+                start_generation(
+                    conn,
+                    task_id=task_id,
+                    plan_version=int(artifact["plan_version"]),
+                    kind="shots",
+                    document=document,
+                    selected_shot_ids=list(request.shot_ids),
+                    base_artifact_id=request.artifact_id,
+                    copied_config=snapshot_config(config),
+                    now=now,
+                    confirm_version=None,
+                )
+            view = read_task_view(conn, task_id)
+            store_replay(conn, method="regenerate", key=idempotency_key, payload=payload, task_id=task_id, view=view, now=now)
             return view
 
 
