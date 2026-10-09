@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 
 from video_agent.errors import VideoAgentError
-from video_agent.media import fit_image
-from video_agent.models import PlanDocument
+from video_agent.lease import hold_lease
+from video_agent.media import _run_ffmpeg, fit_image, probe
+from video_agent.models import PlanDocument, ShotPlan
+from video_agent.ports import ShotRequest
 
 _STAGE = {
     "first_frame": "preparing_first_frame",
@@ -48,6 +52,12 @@ def advance_generation(agent, work_id: str) -> str:
 def _dispatch(agent, work: dict, step: str) -> None:
     if step == "first_frame":
         _step_first_frame(agent, work)
+        return
+    if step == "submit_shot":
+        _step_submit_shot(agent, work)
+        return
+    if step == "import_shot":
+        _step_import_shot(agent, work)
         return
     raise VideoAgentError(
         "MEDIA_EXPORT_FAILED",
@@ -217,3 +227,296 @@ def _one(conn, sql: str, params: tuple = ()) -> dict | None:
 def _transaction(agent):
     with agent.db.transaction() as connection:
         yield connection
+
+
+_ALLOWED = {
+    "VALIDATION_ERROR",
+    "NOT_FOUND",
+    "STATE_CONFLICT",
+    "PLAN_VERSION_CONFLICT",
+    "IDEMPOTENCY_CONFLICT",
+    "FIRST_FRAME_NOT_IMPLEMENTED",
+    "VOICEOVER_DOES_NOT_FIT",
+    "SHOT_DURATION_SHORT",
+    "ASSET_MISSING",
+    "PROVIDER_TEMPORARY",
+    "PROVIDER_REJECTED",
+    "PROVIDER_SUBMISSION_UNCERTAIN",
+    "MEDIA_EXPORT_FAILED",
+}
+_RETRYABLE = {
+    "VALIDATION_ERROR": False,
+    "NOT_FOUND": False,
+    "STATE_CONFLICT": False,
+    "PLAN_VERSION_CONFLICT": False,
+    "IDEMPOTENCY_CONFLICT": False,
+    "FIRST_FRAME_NOT_IMPLEMENTED": False,
+    "VOICEOVER_DOES_NOT_FIT": False,
+    "SHOT_DURATION_SHORT": True,
+    "ASSET_MISSING": True,
+    "PROVIDER_TEMPORARY": True,
+    "PROVIDER_REJECTED": True,
+    "PROVIDER_SUBMISSION_UNCERTAIN": True,
+    "MEDIA_EXPORT_FAILED": True,
+}
+
+
+def _step_submit_shot(agent, work: dict) -> None:
+    _enter(agent, work, "submit_shot")
+    shot = _next_shot(agent, work["generation_id"])
+    if shot is None:
+        _advance(agent, work, "audio")
+        return
+    if shot["submission_state"] in {"intended", "accepted", "uncertain"}:
+        _advance(agent, work, "import_shot")
+        return
+    generation = _require_generation(agent, work["generation_id"])
+    document = PlanDocument.model_validate_json(generation["snapshot_json"])
+    request = _shot_request(agent, work, shot, document)
+    _mark_intended(agent, work["generation_id"], shot["shot_id"], request.provider_idempotency_key)
+    with hold_lease(agent.db, work["work_id"], agent.worker_owner, agent.clock, int(agent.config.lease_seconds)):
+        try:
+            result = agent.video.submit_shot(request)
+        except VideoAgentError:
+            raise
+        except Exception as exc:
+            raise VideoAgentError(
+                "PROVIDER_TEMPORARY",
+                str(exc),
+                stage="generating_shots",
+                retryable=True,
+                shot_ids=[shot["shot_id"]],
+            ) from exc
+    if result.uncertain or not result.external_task_id:
+        _mark_submission(
+            agent,
+            work["generation_id"],
+            shot["shot_id"],
+            "uncertain",
+            result.external_task_id,
+            "pending",
+        )
+        raise VideoAgentError(
+            "PROVIDER_SUBMISSION_UNCERTAIN",
+            "无法确认外部任务是否已经创建",
+            stage="generating_shots",
+            retryable=True,
+            shot_ids=[shot["shot_id"]],
+        )
+    _mark_submission(
+        agent,
+        work["generation_id"],
+        shot["shot_id"],
+        "accepted",
+        result.external_task_id,
+        "submitted",
+    )
+    _advance(agent, work, "import_shot")
+
+
+def _step_import_shot(agent, work: dict) -> None:
+    _enter(agent, work, "import_shot")
+    shot = _next_shot(agent, work["generation_id"])
+    if shot is None:
+        _advance(agent, work, "audio")
+        return
+    if not shot["external_task_id"]:
+        raise VideoAgentError(
+            "PROVIDER_SUBMISSION_UNCERTAIN",
+            "无法确认外部任务是否已经创建",
+            stage="generating_shots",
+            retryable=True,
+            shot_ids=[shot["shot_id"]],
+        )
+    with hold_lease(agent.db, work["work_id"], agent.worker_owner, agent.clock, int(agent.config.lease_seconds)):
+        queried = agent.video.query(
+            external_task_id=shot["external_task_id"],
+            provider_idempotency_key=shot["provider_idempotency_key"],
+        )
+    if queried.state == "pending":
+        _defer(agent, work)
+        return
+    if queried.state == "absent":
+        raise VideoAgentError(
+            "PROVIDER_SUBMISSION_UNCERTAIN",
+            "无法确认外部任务是否已经创建",
+            stage="generating_shots",
+            retryable=True,
+            shot_ids=[shot["shot_id"]],
+        )
+    if queried.state == "failed":
+        code = queried.error_code if queried.error_code in _ALLOWED else "PROVIDER_REJECTED"
+        raise VideoAgentError(
+            code,
+            queried.message or "镜头生成失败",
+            stage="generating_shots",
+            retryable=_RETRYABLE[code],
+            shot_ids=[shot["shot_id"]],
+        )
+    with hold_lease(agent.db, work["work_id"], agent.worker_owner, agent.clock, int(agent.config.lease_seconds)):
+        data = agent.video.download(shot["external_task_id"])
+    root = _gen_dir(agent, work)
+    dest = root / "shots" / f"{shot['shot_id']}.mp4"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    needed = int(shot["end_frame"]) - int(shot["start_frame"])
+    info = probe(dest)
+    if info.frame_count < needed:
+        raise VideoAgentError(
+            "SHOT_DURATION_SHORT",
+            "模型片段短于镜头帧区间",
+            stage="generating_shots",
+            retryable=True,
+            shot_ids=[shot["shot_id"]],
+        )
+    if info.frame_count > needed:
+        trimmed = dest.with_suffix(".trim.mp4")
+        _trim_clip(dest, needed, trimmed, int(agent.config.video_bitrate))
+        os.replace(trimmed, dest)
+        info = probe(dest)
+        if info.frame_count != needed:
+            raise VideoAgentError(
+                "MEDIA_EXPORT_FAILED",
+                "裁切后帧数仍不等于镜头区间",
+                stage="generating_shots",
+                retryable=True,
+                shot_ids=[shot["shot_id"]],
+            )
+    relative = dest.relative_to(agent.files.home).as_posix()
+    _mark_imported(agent, work["generation_id"], shot["shot_id"], relative)
+    if _next_shot(agent, work["generation_id"]) is None:
+        _advance(agent, work, "audio")
+    else:
+        _advance(agent, work, "submit_shot")
+
+
+def _defer(agent, work: dict) -> None:
+    now = agent.clock.now()
+    later = (now + timedelta(seconds=1)).isoformat()
+    until = (now + timedelta(seconds=int(agent.config.lease_seconds))).isoformat()
+    with _transaction(agent) as conn:
+        conn.execute(
+            """UPDATE work_items
+               SET next_attempt_at=?, lease_owner=?, lease_until=?
+               WHERE work_id=?""",
+            (later, agent.worker_owner, until, work["work_id"]),
+        )
+
+
+def _shot_request(agent, work: dict, shot: dict, document: PlanDocument) -> ShotRequest:
+    plan_shot = _plan_shot(document, shot["shot_id"])
+    width, height = _canvas(agent, document.aspect_ratio)
+    references = [_asset_path(agent, asset_id, "generating_shots") for asset_id in _image_ids(agent, work["task_id"])]
+    fitted = _gen_dir(agent, work) / "first_frame_fitted.png"
+    key = shot["provider_idempotency_key"] or f"{work['generation_id']}:{shot['shot_id']}"
+    return ShotRequest(
+        generation_id=work["generation_id"],
+        shot_id=shot["shot_id"],
+        prompt=_prompt(document, plan_shot),
+        shared_visual=document.shared_visual,
+        first_frame_path=fitted if fitted.is_file() else None,
+        reference_paths=references,
+        tail_frame_path=None,
+        frame_count=int(shot["end_frame"]) - int(shot["start_frame"]),
+        aspect_ratio=document.aspect_ratio,
+        fit=document.fit,
+        width=width,
+        height=height,
+        provider_idempotency_key=key,
+    )
+
+
+def _next_shot(agent, generation_id: str) -> dict | None:
+    with _transaction(agent) as conn:
+        return _one(
+            conn,
+            """SELECT * FROM generation_shots
+               WHERE generation_id=? AND status NOT IN ('imported', 'reused')
+               ORDER BY ordinal LIMIT 1""",
+            (generation_id,),
+        )
+
+
+def _mark_intended(agent, generation_id: str, shot_id: str, key: str) -> None:
+    with _transaction(agent) as conn:
+        conn.execute(
+            """UPDATE generation_shots
+               SET provider_idempotency_key=?, submission_state='intended'
+               WHERE generation_id=? AND shot_id=?""",
+            (key, generation_id, shot_id),
+        )
+
+
+def _mark_submission(agent, generation_id: str, shot_id: str, state: str, external_task_id: str | None, status: str) -> None:
+    with _transaction(agent) as conn:
+        conn.execute(
+            """UPDATE generation_shots
+               SET submission_state=?, external_task_id=?, status=?
+               WHERE generation_id=? AND shot_id=?""",
+            (state, external_task_id, status, generation_id, shot_id),
+        )
+
+
+def _mark_imported(agent, generation_id: str, shot_id: str, relative: str) -> None:
+    with _transaction(agent) as conn:
+        conn.execute(
+            """UPDATE generation_shots
+               SET status='imported', clip_path=?
+               WHERE generation_id=? AND shot_id=?""",
+            (relative, generation_id, shot_id),
+        )
+
+
+def _trim_clip(src: Path, frames: int, dest: Path, video_bitrate: int) -> None:
+    _run_ffmpeg(
+        [
+            "-i",
+            str(src),
+            "-frames:v",
+            str(frames),
+            "-r",
+            "30",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "ultrafast",
+            "-b:v",
+            str(video_bitrate),
+            "-an",
+            str(dest),
+        ]
+    )
+
+
+def _image_ids(agent, task_id: str) -> list[str]:
+    with _transaction(agent) as conn:
+        row = _one(conn, "SELECT image_asset_ids_json FROM tasks WHERE task_id=?", (task_id,))
+    if row is None:
+        raise VideoAgentError("NOT_FOUND", "找不到任务")
+    return list(json.loads(row["image_asset_ids_json"]))
+
+
+def _plan_shot(document: PlanDocument, shot_id: str) -> ShotPlan:
+    for shot in document.shots:
+        if shot.shot_id == shot_id:
+            return shot
+    raise VideoAgentError("NOT_FOUND", "找不到镜头", shot_ids=[shot_id])
+
+
+def _prompt(document: PlanDocument, shot: ShotPlan) -> str:
+    visual = document.shared_visual
+    return "\n".join(
+        [
+            visual.product_reference,
+            visual.scene,
+            visual.lighting,
+            visual.palette,
+            visual.style,
+            shot.content,
+            shot.action,
+            shot.shot_size,
+            shot.camera,
+        ]
+    )
