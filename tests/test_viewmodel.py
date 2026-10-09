@@ -525,3 +525,39 @@ def test_settings_form_hides_secrets_and_patch_keeps_empty_string():
     assert "resolutions" not in dumped
     assert "max_images" not in dumped
     assert "max_file_bytes" not in dumped
+
+
+def test_worker_recovers_before_tick_and_sleeps_one_second_when_idle():
+    import threading
+
+    from video_agent.models import TickResult
+
+    from desktop_app.viewmodel import IDLE_SLEEP_SECONDS
+    from desktop_app.worker import start_worker
+
+    order = []
+
+    class Agent:
+        def __init__(self) -> None:
+            self.ticks = 0
+
+        def recover(self) -> int:
+            order.append("recover")
+            return 0
+
+        def tick(self) -> TickResult:
+            self.ticks += 1
+            order.append("tick" if self.ticks == 1 else "tick-again")
+            return TickResult(did_work=self.ticks == 1)
+
+    stop = threading.Event()
+
+    def sleep(seconds: float) -> None:
+        order.append(seconds)
+        stop.set()
+
+    thread = start_worker(Agent(), stop, sleep=sleep)
+    thread.join(timeout=2)
+    assert order == ["recover", "tick", "tick-again", 1]
+    assert IDLE_SLEEP_SECONDS == 1
+    assert thread.is_alive() is False
