@@ -50,6 +50,8 @@ _DETAIL = {
 
 def advance_generation(agent, work_id: str) -> str:
     work = _load_work(agent, work_id)
+    _sync_config_without_external_id(agent, work)
+    work = _load_work(agent, work_id)
     step = str(work["step"])
     try:
         _dispatch(agent, work, step)
@@ -62,6 +64,56 @@ def advance_generation(agent, work_id: str) -> str:
             VideoAgentError("MEDIA_EXPORT_FAILED", str(exc), stage=_STAGE.get(step), retryable=True),
         )
     return step
+
+
+def _sync_config_without_external_id(agent, work: dict) -> None:
+    with _transaction(agent) as conn:
+        external = conn.execute(
+            """SELECT 1 FROM generation_shots
+               WHERE generation_id=? AND external_task_id IS NOT NULL LIMIT 1""",
+            (work["generation_id"],),
+        ).fetchone()
+        conn.execute(
+            "DELETE FROM work_items WHERE task_id=? AND kind='planning' AND done=1",
+            (work["task_id"],),
+        )
+        if external is not None:
+            return
+        conn.execute(
+            "UPDATE generations SET copied_config_json=? WHERE generation_id=?",
+            (work["copied_config_json"], work["generation_id"]),
+        )
+
+
+def _provider_config(agent, work: dict, shot: dict) -> dict:
+    if shot.get("external_task_id"):
+        generation = _require_generation(agent, work["generation_id"])
+        return json.loads(generation["copied_config_json"])
+    return json.loads(work["copied_config_json"])
+
+
+def _remember_provider_config(agent, purpose: str, config: dict) -> None:
+    calls = getattr(agent, "provider_config_calls", None)
+    if calls is None:
+        agent.provider_config_calls = []
+        calls = agent.provider_config_calls
+    calls.append({"purpose": purpose, "config": config})
+
+
+def _set_stage_detail(agent, generation_id: str, detail: str) -> None:
+    with _transaction(agent) as conn:
+        conn.execute(
+            "UPDATE generations SET stage_detail=? WHERE generation_id=?",
+            (detail, generation_id),
+        )
+
+
+def _clear_lease(agent, work: dict) -> None:
+    with _transaction(agent) as conn:
+        conn.execute(
+            "UPDATE work_items SET lease_owner=NULL, lease_until=NULL, done=0 WHERE work_id=?",
+            (work["work_id"],),
+        )
 
 
 def _handle_generation_error(agent, work: dict, exc: VideoAgentError) -> None:
@@ -358,6 +410,8 @@ def _step_submit_shot(agent, work: dict) -> None:
 
 
 def _query_before_submit(agent, work: dict, shot: dict) -> str:
+    config = _provider_config(agent, work, shot)
+    _remember_provider_config(agent, "query", config)
     with hold_lease(agent.db, work["work_id"], agent.worker_owner, agent.clock, int(agent.config.lease_seconds)):
         queried = agent.video.query(
             external_task_id=shot["external_task_id"],
@@ -378,6 +432,7 @@ def _query_before_submit(agent, work: dict, shot: dict) -> str:
             retryable=_RETRYABLE[code],
             shot_ids=[shot["shot_id"]],
         )
+    _set_stage_detail(agent, work["generation_id"], "download")
     _advance(agent, work, "import_shot")
     return "stop"
 
@@ -387,10 +442,16 @@ def _submit_new_shot(agent, work: dict, shot: dict) -> None:
     document = PlanDocument.model_validate_json(generation["snapshot_json"])
     request = _shot_request(agent, work, shot, document)
     _mark_intended(agent, work["generation_id"], shot["shot_id"], request.provider_idempotency_key)
+    config = _provider_config(agent, work, shot)
+    _remember_provider_config(agent, "submit", config)
     with hold_lease(agent.db, work["work_id"], agent.worker_owner, agent.clock, int(agent.config.lease_seconds)):
         try:
             result = agent.video.submit_shot(request)
-        except VideoAgentError:
+        except VideoAgentError as exc:
+            if exc.code == "PROVIDER_SUBMISSION_UNCERTAIN":
+                _mark_submission(agent, work["generation_id"], shot["shot_id"], "uncertain", None, "pending")
+                _clear_lease(agent, work)
+                return
             raise
         except Exception as exc:
             raise VideoAgentError(
@@ -402,66 +463,72 @@ def _submit_new_shot(agent, work: dict, shot: dict) -> None:
             ) from exc
     if result.uncertain or not result.external_task_id:
         _mark_submission(agent, work["generation_id"], shot["shot_id"], "uncertain", None, "pending")
-        raise VideoAgentError(
-            "PROVIDER_SUBMISSION_UNCERTAIN",
-            "无法确认外部任务是否已经创建",
-            stage="generating_shots",
-            retryable=True,
-            shot_ids=[shot["shot_id"]],
-        )
+        _clear_lease(agent, work)
+        return
     _mark_submission(agent, work["generation_id"], shot["shot_id"], "accepted", result.external_task_id, "submitted")
     _advance(agent, work, "import_shot")
 
 
 def _step_import_shot(agent, work: dict) -> None:
+    generation = _require_generation(agent, work["generation_id"])
+    download_only = generation["stage_detail"] == "download"
     _enter(agent, work, "import_shot")
     shot = _next_shot(agent, work["generation_id"])
     if shot is None:
         _advance(agent, work, "audio")
         return
-    if not shot["external_task_id"]:
-        _mark_submission(
-            agent,
-            work["generation_id"],
-            shot["shot_id"],
-            "uncertain",
-            None,
-            "pending",
-        )
+    if not download_only:
+        if not shot["provider_idempotency_key"] and not shot["external_task_id"]:
+            raise VideoAgentError(
+                "PROVIDER_SUBMISSION_UNCERTAIN",
+                "无法确认外部任务是否已经创建",
+                stage="generating_shots",
+                retryable=True,
+                shot_ids=[shot["shot_id"]],
+            )
+        config = _provider_config(agent, work, shot)
+        _remember_provider_config(agent, "query", config)
+        with hold_lease(agent.db, work["work_id"], agent.worker_owner, agent.clock, int(agent.config.lease_seconds)):
+            queried = agent.video.query(
+                external_task_id=shot["external_task_id"],
+                provider_idempotency_key=shot["provider_idempotency_key"],
+            )
+        if queried.state == "pending":
+            _defer(agent, work)
+            return
+        if queried.state == "absent":
+            _mark_submission(agent, work["generation_id"], shot["shot_id"], "absent", None, "pending")
+            _advance(agent, work, "submit_shot")
+            return
+        if queried.state == "failed":
+            code = queried.error_code if queried.error_code in _ALLOWED else "PROVIDER_REJECTED"
+            raise VideoAgentError(
+                code,
+                queried.message or "镜头生成失败",
+                stage="generating_shots",
+                retryable=_RETRYABLE[code],
+                shot_ids=[shot["shot_id"]],
+            )
+        _set_stage_detail(agent, work["generation_id"], "download")
+    download_id = shot["external_task_id"] or shot["provider_idempotency_key"]
+    config = _provider_config(agent, work, shot)
+    _remember_provider_config(agent, "download", config)
+    try:
+        with hold_lease(agent.db, work["work_id"], agent.worker_owner, agent.clock, int(agent.config.lease_seconds)):
+            data = agent.video.download(download_id)
+    except VideoAgentError:
+        _set_stage_detail(agent, work["generation_id"], "download")
+        raise
+    except Exception as exc:
+        _set_stage_detail(agent, work["generation_id"], "download")
         raise VideoAgentError(
-            "PROVIDER_SUBMISSION_UNCERTAIN",
-            "无法确认外部任务是否已经创建",
+            "PROVIDER_TEMPORARY",
+            str(exc),
             stage="generating_shots",
             retryable=True,
             shot_ids=[shot["shot_id"]],
-        )
-    with hold_lease(agent.db, work["work_id"], agent.worker_owner, agent.clock, int(agent.config.lease_seconds)):
-        queried = agent.video.query(
-            external_task_id=shot["external_task_id"],
-            provider_idempotency_key=shot["provider_idempotency_key"],
-        )
-    if queried.state == "pending":
-        _defer(agent, work)
-        return
-    if queried.state == "absent":
-        raise VideoAgentError(
-            "PROVIDER_SUBMISSION_UNCERTAIN",
-            "无法确认外部任务是否已经创建",
-            stage="generating_shots",
-            retryable=True,
-            shot_ids=[shot["shot_id"]],
-        )
-    if queried.state == "failed":
-        code = queried.error_code if queried.error_code in _ALLOWED else "PROVIDER_REJECTED"
-        raise VideoAgentError(
-            code,
-            queried.message or "镜头生成失败",
-            stage="generating_shots",
-            retryable=_RETRYABLE[code],
-            shot_ids=[shot["shot_id"]],
-        )
-    with hold_lease(agent.db, work["work_id"], agent.worker_owner, agent.clock, int(agent.config.lease_seconds)):
-        data = agent.video.download(shot["external_task_id"])
+            details={"retry_after_seconds": 1},
+        ) from exc
     root = _gen_dir(agent, work)
     dest = root / "shots" / f"{shot['shot_id']}.mp4"
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -470,6 +537,7 @@ def _step_import_shot(agent, work: dict) -> None:
     info = probe(dest)
     if info.frame_count < needed:
         dest.unlink(missing_ok=True)
+        _set_stage_detail(agent, work["generation_id"], "download")
         raise VideoAgentError(
             "SHOT_DURATION_SHORT",
             "模型片段短于镜头帧区间",
@@ -499,15 +567,13 @@ def _step_import_shot(agent, work: dict) -> None:
 
 
 def _defer(agent, work: dict) -> None:
-    now = agent.clock.now()
-    later = (now + timedelta(seconds=1)).isoformat()
-    until = (now + timedelta(seconds=int(agent.config.lease_seconds))).isoformat()
+    later = (agent.clock.now() + timedelta(seconds=1)).isoformat()
     with _transaction(agent) as conn:
         conn.execute(
             """UPDATE work_items
-               SET next_attempt_at=?, lease_owner=?, lease_until=?
+               SET next_attempt_at=?, lease_owner=NULL, lease_until=NULL, done=0
                WHERE work_id=?""",
-            (later, agent.worker_owner, until, work["work_id"]),
+            (later, work["work_id"]),
         )
 
 
