@@ -10,6 +10,7 @@ from pathlib import Path
 
 from video_agent.errors import VideoAgentError
 from video_agent.lease import hold_lease
+import video_agent.media as media
 from video_agent.media import (
     _atempo_pad,
     _concat_audio,
@@ -18,7 +19,6 @@ from video_agent.media import (
     _run_ffmpeg,
     _silence,
     burn_subtitles,
-    concat_clips,
     extract_png,
     fit_image,
     mix_audio,
@@ -674,7 +674,7 @@ def _step_compose(agent, work: dict) -> None:
             raise VideoAgentError("MEDIA_EXPORT_FAILED", "镜头片段尚未导入", stage="composing", retryable=True, shot_ids=[shot_id])
         clips.append(agent.files.path_for(clip_path))
     dest = _gen_dir(agent, work) / "composed.mp4"
-    concat_clips(clips, dest)
+    media.concat_clips(clips, dest)
     info = probe(dest)
     if info.frame_count != document.duration_seconds * 30 or info.has_audio:
         raise VideoAgentError(
@@ -982,7 +982,7 @@ def _neighbor_media(agent, work: dict, generation: dict, document: PlanDocument,
             clip = None if base is None else base / "shots" / f"{left.shot_id}.mp4"
         if clip is None or not clip.is_file():
             raise VideoAgentError("MEDIA_EXPORT_FAILED", "左侧相邻镜头片段不存在", stage="generating_shots", retryable=True, shot_ids=[left.shot_id])
-        dest = _gen_dir(agent, work) / "frames" / f"{left.shot_id}-taken-end.png"
+        dest = _gen_dir(agent, work) / "frames" / f"{left.shot_id}-neighbor-end.png"
         dest.parent.mkdir(parents=True, exist_ok=True)
         extract_png(clip, probe(clip).frame_count - 1, dest)
         first_path = dest
@@ -993,7 +993,7 @@ def _neighbor_media(agent, work: dict, generation: dict, document: PlanDocument,
             clip = None if base is None else base / "shots" / f"{right.shot_id}.mp4"
             if clip is None or not clip.is_file():
                 raise VideoAgentError("MEDIA_EXPORT_FAILED", "右侧相邻镜头片段不存在", stage="generating_shots", retryable=True, shot_ids=[right.shot_id])
-            dest = _gen_dir(agent, work) / "frames" / f"{right.shot_id}-taken-start.png"
+            dest = _gen_dir(agent, work) / "frames" / f"{right.shot_id}-neighbor-start.png"
             dest.parent.mkdir(parents=True, exist_ok=True)
             extract_png(clip, 0, dest)
             tail_path = dest
