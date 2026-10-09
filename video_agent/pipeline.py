@@ -1116,7 +1116,7 @@ def _neighbor_media(agent, work: dict, generation: dict, document: PlanDocument,
             clip = None if base is None else base / "shots" / f"{left.shot_id}.mp4"
         if clip is None or not clip.is_file():
             raise VideoAgentError("MEDIA_EXPORT_FAILED", "左侧相邻镜头片段不存在", stage="generating_shots", retryable=True, shot_ids=[left.shot_id])
-        dest = _gen_dir(agent, work) / "frames" / f"{left.shot_id}-neighbor-end.png"
+        dest = _gen_dir(agent, work) / "frames" / f"{left.shot_id}-taken-end.png"
         dest.parent.mkdir(parents=True, exist_ok=True)
         extract_png(clip, probe(clip).frame_count - 1, dest)
         first_path = dest
@@ -1127,7 +1127,7 @@ def _neighbor_media(agent, work: dict, generation: dict, document: PlanDocument,
             clip = None if base is None else base / "shots" / f"{right.shot_id}.mp4"
             if clip is None or not clip.is_file():
                 raise VideoAgentError("MEDIA_EXPORT_FAILED", "右侧相邻镜头片段不存在", stage="generating_shots", retryable=True, shot_ids=[right.shot_id])
-            dest = _gen_dir(agent, work) / "frames" / f"{right.shot_id}-neighbor-start.png"
+            dest = _gen_dir(agent, work) / "frames" / f"{right.shot_id}-taken-start.png"
             dest.parent.mkdir(parents=True, exist_ok=True)
             extract_png(clip, 0, dest)
             tail_path = dest
