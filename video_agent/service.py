@@ -15,6 +15,8 @@ from video_agent.idempotency import (
     discard_revision_payload,
     lookup_replay,
     regenerate_payload,
+    retry_generation_payload,
+    retry_planning_payload,
     revise_plan_payload,
     store_replay,
     submit_inputs_payload,
@@ -372,6 +374,125 @@ class VideoAgent:
             store_replay(conn, method="discard_revision", key=idempotency_key, payload=payload, task_id=task_id, view=view, now=now)
             return view
 
+    def retry_planning(self, task_id: str, *, idempotency_key: str | None = None) -> TaskView:
+        validate_idempotency_key(idempotency_key)
+        config = self._refresh_config()
+        payload = retry_planning_payload(task_id)
+        now = self.clock.now().isoformat()
+        with self.db.transaction() as conn:
+            replay = lookup_replay(conn, "retry_planning", idempotency_key, payload)
+            if replay is not None:
+                return replay
+            task = read_task_row(conn, task_id)
+            assert_mutation_allowed(task, "retry_planning", has_plan=has_plan(conn, task_id))
+            conn.execute(
+                """UPDATE tasks SET
+                    status='pending', stage=NULL, stage_detail=NULL,
+                    failure_scope=NULL, failure_code=NULL, failure_message=NULL,
+                    failure_stage=NULL, failure_retryable=NULL, failure_details_json=NULL,
+                    questions_json='[]', completed_shots=NULL, total_shots=NULL, updated_at=?
+                   WHERE task_id=?""",
+                (now, task_id),
+            )
+            insert_work(
+                conn,
+                task_id=task_id,
+                kind="planning",
+                generation_id=None,
+                ready_at=now,
+                copied_config=snapshot_config(config),
+                step="start",
+            )
+            view = read_task_view(conn, task_id)
+            store_replay(conn, method="retry_planning", key=idempotency_key, payload=payload, task_id=task_id, view=view, now=now)
+            return view
+
+    def retry_generation(self, generation_id: str, *, idempotency_key: str | None = None) -> TaskView:
+        validate_idempotency_key(idempotency_key)
+        config = self._refresh_config()
+        payload = retry_generation_payload(generation_id)
+        now = self.clock.now().isoformat()
+        with self.db.transaction() as conn:
+            replay = lookup_replay(conn, "retry_generation", idempotency_key, payload)
+            if replay is not None:
+                return replay
+            generation = conn.execute("SELECT * FROM generations WHERE generation_id=?", (generation_id,)).fetchone()
+            if generation is None:
+                raise VideoAgentError("NOT_FOUND", "执行不存在", generation_id=generation_id)
+            task = read_task_row(conn, generation["task_id"])
+            assert_mutation_allowed(task, "retry_generation", has_plan=has_plan(conn, generation["task_id"]))
+            if generation["status"] != "failed" or not generation["failure_retryable"]:
+                raise VideoAgentError(
+                    "STATE_CONFLICT",
+                    "该失败不能重试",
+                    task_id=generation["task_id"],
+                    generation_id=generation_id,
+                )
+            step = {
+                "queued": "first_frame",
+                "preparing_first_frame": "first_frame",
+                "generating_shots": "submit_shot",
+                "preparing_audio": "audio",
+                "composing": "compose",
+                "checking_visuals": "visual",
+                "exporting": "export",
+            }.get(generation["stage"])
+            if step is None:
+                raise VideoAgentError("STATE_CONFLICT", "该失败不能重试", task_id=generation["task_id"], generation_id=generation_id)
+            new_status = "queued" if generation["stage"] == "queued" else "running"
+            conn.execute(
+                """UPDATE generations SET
+                    status=?, failure_code=NULL, failure_message=NULL, failure_stage=NULL,
+                    failure_retryable=NULL, failure_details_json=NULL, auto_attempts_used=0,
+                    next_attempt_at=NULL, updated_at=?
+                   WHERE generation_id=?""",
+                (new_status, now, generation_id),
+            )
+            conn.execute(
+                """UPDATE tasks SET
+                    status='generating', stage=?, stage_detail=NULL,
+                    failure_scope=NULL, failure_code=NULL, failure_message=NULL,
+                    failure_stage=NULL, failure_retryable=NULL, failure_details_json=NULL,
+                    completed_shots=?, total_shots=?, updated_at=?
+                   WHERE task_id=?""",
+                (generation["stage"], generation["completed_shots"], generation["total_shots"], now, generation["task_id"]),
+            )
+            external = conn.execute(
+                "SELECT 1 AS ok FROM generation_shots WHERE generation_id=? AND external_task_id IS NOT NULL LIMIT 1",
+                (generation_id,),
+            ).fetchone()
+            copied = None if external is not None else snapshot_config(config)
+            work = conn.execute(
+                "SELECT work_id FROM work_items WHERE generation_id=? ORDER BY ready_at DESC LIMIT 1",
+                (generation_id,),
+            ).fetchone()
+            if work is None:
+                raw = copied if copied is not None else json.loads(generation["copied_config_json"])
+                insert_work(
+                    conn,
+                    task_id=generation["task_id"],
+                    kind="generation",
+                    generation_id=generation_id,
+                    ready_at=now,
+                    copied_config=raw,
+                    step=step,
+                )
+            elif copied is None:
+                conn.execute(
+                    """UPDATE work_items SET done=0, lease_owner=NULL, lease_until=NULL,
+                       step=?, ready_at=?, next_attempt_at=NULL WHERE work_id=?""",
+                    (step, now, work["work_id"]),
+                )
+            else:
+                conn.execute(
+                    """UPDATE work_items SET done=0, lease_owner=NULL, lease_until=NULL,
+                       step=?, ready_at=?, next_attempt_at=NULL, copied_config_json=? WHERE work_id=?""",
+                    (step, now, dumps(copied), work["work_id"]),
+                )
+            view = read_task_view(conn, generation["task_id"])
+            store_replay(conn, method="retry_generation", key=idempotency_key, payload=payload, task_id=generation["task_id"], view=view, now=now)
+            return view
+
     def confirm(self, task_id: str, plan_version: int, *, idempotency_key: str | None = None) -> TaskView:
         validate_idempotency_key(idempotency_key)
         config = self._refresh_config()
@@ -396,8 +517,9 @@ class VideoAgent:
                     generation_id=None if existing is None else existing["generation_id"],
                     plan_version=plan_version,
                 )
-            if task["status"] in {"pending", "planning", "generating"}:
-                raise VideoAgentError("STATE_CONFLICT", "当前状态不允许该操作", task_id=task_id, generation_id=task["generation_id"])
+            plan_exists = has_plan(conn, task_id)
+            if task["status"] in {"awaiting_input", "pending", "planning", "generating", "failed"}:
+                assert_mutation_allowed(task, "confirm", has_plan=plan_exists)
             version_row = conn.execute(
                 "SELECT abandoned FROM plan_versions WHERE task_id=? AND plan_version=?",
                 (task_id, plan_version),
@@ -411,7 +533,7 @@ class VideoAgent:
                     plan_version=plan_version,
                     details={"head_plan_version": head},
                 )
-            assert_mutation_allowed(task, "confirm", has_plan=True)
+            assert_mutation_allowed(task, "confirm", has_plan=plan_exists)
             document = load_plan_document(conn, task_id, plan_version)
             start_generation(
                 conn,
