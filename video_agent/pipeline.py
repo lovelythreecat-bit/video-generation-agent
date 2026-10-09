@@ -561,21 +561,25 @@ def _step_audio(agent, work: dict) -> None:
     _enter(agent, work, "audio")
     generation = _require_generation(agent, work["generation_id"])
     document = PlanDocument.model_validate_json(generation["snapshot_json"])
+    root = _gen_dir(agent, work)
+    if not rebuilds_audio(str(generation["kind"])):
+        _copy_base_audio(agent, generation, root, document)
+        _advance(agent, work, "compose")
+        return
     if not document.voiceover and not document.music:
         _advance(agent, work, "compose")
         return
-    if document.voiceover and agent.voice is None:
+    if document.voiceover and agent.voice is None and not (root / "voice.m4a").is_file():
         raise VideoAgentError(
             "PROVIDER_REJECTED",
             "配音已开启，但没有可用的配音实现",
             stage="preparing_audio",
             retryable=True,
         )
-    root = _gen_dir(agent, work)
     bitrate = int(agent.config.audio_bitrate)
-    if document.voiceover:
+    if document.voiceover and not (root / "voice.m4a").is_file():
         _build_voice(agent, work, document, root, bitrate)
-    if document.music:
+    if document.music and not (root / "music.m4a").is_file():
         _build_music(agent, work, document, root, bitrate)
     _advance(agent, work, "compose")
 
@@ -869,4 +873,40 @@ def _appearance(document: PlanDocument) -> str:
     visual = document.shared_visual
     parts = [visual.product_reference, visual.character or "", visual.scene, visual.lighting, visual.palette, visual.style]
     return "\n".join(part for part in parts if part)
+
+
+def rebuilds_audio(kind: str) -> bool:
+    return kind == "full"
+
+
+def _base_generation_dir(agent, generation: dict) -> Path | None:
+    if not generation.get("base_artifact_id"):
+        return None
+    with _transaction(agent) as conn:
+        row = _one(
+            conn,
+            "SELECT task_id, generation_id FROM artifacts WHERE artifact_id=?",
+            (generation["base_artifact_id"],),
+        )
+    if row is None:
+        return None
+    return agent.files.home / "tasks" / row["task_id"] / "generations" / row["generation_id"]
+
+
+def _copy_base_audio(agent, generation: dict, root: Path, document: PlanDocument) -> None:
+    base = _base_generation_dir(agent, generation)
+    if base is None:
+        raise VideoAgentError("MEDIA_EXPORT_FAILED", "找不到基础成品的执行目录", stage="preparing_audio", retryable=True)
+    root.mkdir(parents=True, exist_ok=True)
+    for name in ("voice.m4a", "music.m4a", "cues.json"):
+        source = base / name
+        dest = root / name
+        if source.is_file() and not dest.is_file():
+            shutil.copyfile(source, dest)
+    if document.voiceover and not (root / "voice.m4a").is_file():
+        raise VideoAgentError("MEDIA_EXPORT_FAILED", "基础配音不存在", stage="preparing_audio", retryable=True)
+    if document.music and not (root / "music.m4a").is_file():
+        raise VideoAgentError("MEDIA_EXPORT_FAILED", "基础音乐不存在", stage="preparing_audio", retryable=True)
+    if document.subtitles and document.voiceover and not (root / "cues.json").is_file():
+        raise VideoAgentError("MEDIA_EXPORT_FAILED", "基础字幕时间不存在", stage="preparing_audio", retryable=True)
 
