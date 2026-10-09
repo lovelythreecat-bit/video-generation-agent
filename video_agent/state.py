@@ -2,8 +2,10 @@ import json
 import sqlite3
 import uuid
 
+from video_agent.config import ASPECT_RATIOS
 from video_agent.errors import VideoAgentError
-from video_agent.models import AudioOptions, FailureView, ProductInfo, TaskView, VideoOptions
+from video_agent.frames import redistribute
+from video_agent.models import AudioOptions, FailureView, PlanDocument, PlanPatch, ProductInfo, ShotPlan, TaskView, VideoOptions
 
 
 def dumps(value: object) -> str:
@@ -134,3 +136,166 @@ def insert_work(
         (work_id, task_id, kind, generation_id, ready_at, dumps(copied_config), step),
     )
     return work_id
+
+
+def load_plan_document(conn: sqlite3.Connection, task_id: str, plan_version: int) -> PlanDocument:
+    row = conn.execute(
+        "SELECT document_json FROM plan_versions WHERE task_id=? AND plan_version=?",
+        (task_id, plan_version),
+    ).fetchone()
+    if row is None:
+        raise VideoAgentError("NOT_FOUND", "方案不存在", task_id=task_id, plan_version=plan_version)
+    return PlanDocument.model_validate_json(row["document_json"])
+
+
+def publish_document(conn: sqlite3.Connection, *, task_id: str, document: PlanDocument, now: str) -> int:
+    row = conn.execute(
+        "SELECT COALESCE(MAX(plan_version), 0) + 1 AS n FROM plan_versions WHERE task_id=?",
+        (task_id,),
+    ).fetchone()
+    version = int(row["n"])
+    conn.execute(
+        """INSERT INTO plan_versions (task_id, plan_version, document_json, abandoned, created_at)
+           VALUES (?, ?, ?, 0, ?)""",
+        (task_id, version, document.model_dump_json(), now),
+    )
+    conn.execute(
+        """UPDATE tasks SET
+            status='awaiting_confirmation', stage=NULL, stage_detail=NULL,
+            failure_scope=NULL, failure_code=NULL, failure_message=NULL,
+            failure_stage=NULL, failure_retryable=NULL, failure_details_json=NULL,
+            questions_json='[]', head_plan_version=?, pending_instruction=NULL,
+            completed_shots=NULL, total_shots=NULL, updated_at=?
+           WHERE task_id=?""",
+        (version, now, task_id),
+    )
+    return version
+
+
+def validate_frame_span(shots: list[ShotPlan], total_frames: int) -> None:
+    if len(shots) == 0:
+        raise VideoAgentError("VALIDATION_ERROR", "方案至少要有一个镜头", fields=["shots"])
+    cursor = 0
+    for shot in shots:
+        if shot.start_frame != cursor or shot.end_frame <= shot.start_frame:
+            raise VideoAgentError("VALIDATION_ERROR", "帧区间必须首尾相接", fields=["shots"])
+        cursor = shot.end_frame
+    if cursor != total_frames:
+        raise VideoAgentError("VALIDATION_ERROR", "帧区间必须覆盖整段时长", fields=["shots"])
+
+
+def apply_patch(
+    document: PlanDocument,
+    patch: PlanPatch,
+    *,
+    duration_tiers: list[int],
+    native_aspects: list[str],
+    image_asset_ids: list[str],
+    audio_asset_ids: set[str],
+) -> PlanDocument:
+    if patch.shots is not None and patch.shot_texts is not None:
+        raise VideoAgentError("VALIDATION_ERROR", "shots 和 shot_texts 不能同时出现", fields=["shots", "shot_texts"])
+    if patch.clear_first_frame and patch.first_frame_asset_id:
+        raise VideoAgentError("VALIDATION_ERROR", "不能同时指定和清除首帧", fields=["first_frame_asset_id"])
+    if patch.clear_music_asset and patch.music_asset_id:
+        raise VideoAgentError("VALIDATION_ERROR", "不能同时指定和清除音乐素材", fields=["music_asset_id"])
+    duration = document.duration_seconds
+    if patch.duration_seconds is not None:
+        if patch.duration_seconds not in duration_tiers:
+            raise VideoAgentError(
+                "VALIDATION_ERROR",
+                "时长不在当前档位",
+                fields=["duration_seconds"],
+                details={"duration_tiers": list(duration_tiers)},
+            )
+        duration = patch.duration_seconds
+    aspect = document.aspect_ratio
+    fit = document.fit
+    if patch.aspect_ratio is not None:
+        if patch.aspect_ratio not in ASPECT_RATIOS:
+            raise VideoAgentError(
+                "VALIDATION_ERROR",
+                "画面比例不在预设中",
+                fields=["aspect_ratio"],
+                details={"aspect_ratios": list(ASPECT_RATIOS)},
+            )
+        aspect = patch.aspect_ratio
+        if patch.fit is not None:
+            fit = patch.fit
+        elif aspect in native_aspects:
+            fit = "native"
+        else:
+            fit = "pad"
+    elif patch.fit is not None:
+        fit = patch.fit
+    subtitles = document.subtitles if patch.subtitles is None else patch.subtitles
+    voiceover = document.voiceover if patch.voiceover is None else patch.voiceover
+    music = document.music if patch.music is None else patch.music
+    language = document.language if patch.language is None else patch.language
+    voice_preference = document.voice_preference if patch.voice_preference is None else patch.voice_preference
+    music_direction = document.music_direction if patch.music_direction is None else patch.music_direction
+    music_asset_id = None if patch.clear_music_asset else document.music_asset_id
+    if patch.music_asset_id is not None:
+        if patch.music_asset_id not in audio_asset_ids:
+            raise VideoAgentError("VALIDATION_ERROR", "音乐素材不存在或不是音频", fields=["music_asset_id"])
+        music_asset_id = patch.music_asset_id
+    shared = document.shared_visual if patch.shared_visual is None else patch.shared_visual
+    first_source = document.first_frame_source
+    first_id = document.first_frame_asset_id
+    if patch.clear_first_frame:
+        first_source = "generate"
+        first_id = None
+    elif patch.first_frame_asset_id is not None:
+        if patch.first_frame_asset_id not in image_asset_ids:
+            raise VideoAgentError("VALIDATION_ERROR", "首帧必须是本任务图片中的一张", fields=["first_frame_asset_id"])
+        first_source = "selected"
+        first_id = patch.first_frame_asset_id
+    if patch.shots is not None:
+        shots = [shot.model_copy(deep=True) for shot in patch.shots]
+    else:
+        shots = [shot.model_copy(deep=True) for shot in document.shots]
+        if patch.shot_texts:
+            index_by_id = {shot.shot_id: index for index, shot in enumerate(shots)}
+            for text in patch.shot_texts:
+                index = index_by_id.get(text.shot_id)
+                if index is None:
+                    raise VideoAgentError("VALIDATION_ERROR", "镜头标识不存在", fields=["shot_texts"], shot_ids=[text.shot_id])
+                updates = {}
+                for field in ("content", "action", "shot_size", "camera", "scene_id", "subtitle_text", "voiceover_text"):
+                    value = getattr(text, field)
+                    if value is not None:
+                        updates[field] = value
+                shots[index] = shots[index].model_copy(update=updates)
+        if duration != document.duration_seconds:
+            lengths = [shot.end_frame - shot.start_frame for shot in shots]
+            resized = []
+            cursor = 0
+            for shot, length in zip(shots, redistribute(lengths, duration * 30), strict=True):
+                resized.append(shot.model_copy(update={"start_frame": cursor, "end_frame": cursor + length}))
+                cursor += length
+            shots = resized
+    validate_frame_span(shots, duration * 30)
+    if subtitles and not document.subtitles and any(shot.subtitle_text.strip() == "" for shot in shots):
+        raise VideoAgentError("VALIDATION_ERROR", "打开字幕时每个镜头都要有字幕文案", fields=["subtitles"])
+    if voiceover and not document.voiceover and any(shot.voiceover_text.strip() == "" for shot in shots):
+        raise VideoAgentError("VALIDATION_ERROR", "打开配音时每个镜头都要有配音文案", fields=["voiceover"])
+    if music and not document.music and music_direction.strip() == "" and not music_asset_id:
+        raise VideoAgentError("VALIDATION_ERROR", "打开音乐时要有音乐方向或已登记音频", fields=["music"])
+    return document.model_copy(
+        update={
+            "shared_visual": shared,
+            "shots": shots,
+            "music_direction": music_direction,
+            "music_asset_id": music_asset_id,
+            "duration_seconds": duration,
+            "aspect_ratio": aspect,
+            "fit": fit,
+            "subtitles": subtitles,
+            "voiceover": voiceover,
+            "music": music,
+            "first_frame_source": first_source,
+            "first_frame_asset_id": first_id,
+            "language": language,
+            "voice_preference": voice_preference,
+        }
+    )

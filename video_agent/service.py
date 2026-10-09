@@ -11,7 +11,9 @@ from video_agent.errors import VideoAgentError
 from video_agent.files import LocalFileStore
 from video_agent.idempotency import (
     create_task_payload,
+    discard_revision_payload,
     lookup_replay,
+    revise_plan_payload,
     store_replay,
     submit_inputs_payload,
     validate_idempotency_key,
@@ -20,15 +22,19 @@ from video_agent.models import (
     AudioOptions,
     CreateTaskRequest,
     InputPatch,
+    PlanChange,
     ProductInfo,
     TaskView,
     VideoOptions,
 )
 from video_agent.state import (
+    apply_patch,
     assert_mutation_allowed,
     dumps,
     has_plan,
     insert_work,
+    load_plan_document,
+    publish_document,
     read_task_row,
     read_task_view,
 )
@@ -243,6 +249,123 @@ class VideoAgent:
                 )
             view = read_task_view(conn, task_id)
             store_replay(conn, method="submit_inputs", key=idempotency_key, payload=payload, task_id=task_id, view=view, now=now)
+            return view
+
+    def _native_aspects(self) -> list[str]:
+        if self.video is not None:
+            return list(self.video.capabilities().native_aspects)
+        from video_agent.ports import DEFAULT_VIDEO_CAPABILITIES
+
+        return list(DEFAULT_VIDEO_CAPABILITIES.native_aspects)
+
+    def revise_plan(self, task_id: str, change: PlanChange, *, idempotency_key: str | None = None) -> TaskView:
+        validate_idempotency_key(idempotency_key)
+        config = self._refresh_config()
+        payload = revise_plan_payload(task_id, change)
+        now = self.clock.now().isoformat()
+        with self.db.transaction() as conn:
+            replay = lookup_replay(conn, "revise_plan", idempotency_key, payload)
+            if replay is not None:
+                return replay
+            provided = (change.instruction is not None, change.patch is not None)
+            if provided == (False, False) or provided == (True, True):
+                raise VideoAgentError("VALIDATION_ERROR", "修改必须恰好提供自然语言或结构化补丁中的一个", fields=["instruction", "patch"])
+            task = read_task_row(conn, task_id)
+            assert_mutation_allowed(task, "revise_plan", has_plan=has_plan(conn, task_id))
+            if change.instruction is not None:
+                if change.instruction.strip() == "":
+                    raise VideoAgentError("VALIDATION_ERROR", "自然语言修改不能为空", fields=["instruction"])
+                conn.execute(
+                    """UPDATE tasks SET
+                        status='pending', stage=NULL, stage_detail=NULL,
+                        failure_scope=NULL, failure_code=NULL, failure_message=NULL,
+                        failure_stage=NULL, failure_retryable=NULL, failure_details_json=NULL,
+                        questions_json='[]', pending_instruction=?, completed_shots=NULL,
+                        total_shots=NULL, updated_at=?
+                       WHERE task_id=?""",
+                    (change.instruction, now, task_id),
+                )
+                insert_work(
+                    conn,
+                    task_id=task_id,
+                    kind="planning",
+                    generation_id=None,
+                    ready_at=now,
+                    copied_config=snapshot_config(config),
+                    step="start",
+                )
+            else:
+                if task["head_plan_version"] is None:
+                    raise VideoAgentError("STATE_CONFLICT", "还没有可修改的方案", task_id=task_id)
+                current = load_plan_document(conn, task_id, int(task["head_plan_version"]))
+                audios = {row["asset_id"] for row in conn.execute("SELECT asset_id FROM assets WHERE kind='audio'")}
+                assert change.patch is not None
+                updated = apply_patch(
+                    current,
+                    change.patch,
+                    duration_tiers=list(config.duration_tiers),
+                    native_aspects=self._native_aspects(),
+                    image_asset_ids=json.loads(task["image_asset_ids_json"]),
+                    audio_asset_ids=audios,
+                )
+                publish_document(conn, task_id=task_id, document=updated, now=now)
+            view = read_task_view(conn, task_id)
+            store_replay(conn, method="revise_plan", key=idempotency_key, payload=payload, task_id=task_id, view=view, now=now)
+            return view
+
+    def discard_revision(self, task_id: str, *, idempotency_key: str | None = None) -> TaskView:
+        validate_idempotency_key(idempotency_key)
+        payload = discard_revision_payload(task_id)
+        now = self.clock.now().isoformat()
+        with self.db.transaction() as conn:
+            replay = lookup_replay(conn, "discard_revision", idempotency_key, payload)
+            if replay is not None:
+                return replay
+            task = read_task_row(conn, task_id)
+            assert_mutation_allowed(task, "discard_revision", has_plan=has_plan(conn, task_id))
+            confirmed = int(task["confirmed_plan_version"])
+            head = task["head_plan_version"]
+            if head is not None and head != confirmed:
+                conn.execute(
+                    "UPDATE plan_versions SET abandoned=1 WHERE task_id=? AND plan_version=?",
+                    (task_id, head),
+                )
+            generation = conn.execute(
+                """SELECT * FROM generations
+                   WHERE task_id=? AND plan_version=?
+                   ORDER BY created_at DESC, generation_id DESC LIMIT 1""",
+                (task_id, confirmed),
+            ).fetchone()
+            if generation is None:
+                status, stage, generation_id = "succeeded", None, None
+                failure = (None, None, None, None, None)
+            elif generation["status"] == "succeeded":
+                status, stage, generation_id = "succeeded", None, generation["generation_id"]
+                failure = (None, None, None, None, None)
+            elif generation["status"] == "failed":
+                status = "failed"
+                stage = generation["failure_stage"] or generation["stage"]
+                generation_id = generation["generation_id"]
+                failure = (
+                    "generation",
+                    generation["failure_code"],
+                    generation["failure_message"],
+                    generation["failure_stage"],
+                    generation["failure_retryable"],
+                )
+            else:
+                raise VideoAgentError("STATE_CONFLICT", "已确认版本仍有未结束的执行", task_id=task_id)
+            conn.execute(
+                """UPDATE tasks SET
+                    status=?, stage=?, stage_detail=NULL, failure_scope=?, failure_code=?,
+                    failure_message=?, failure_stage=?, failure_retryable=?, failure_details_json=NULL,
+                    questions_json='[]', head_plan_version=?, pending_instruction=NULL,
+                    generation_id=?, completed_shots=NULL, total_shots=NULL, updated_at=?
+                   WHERE task_id=?""",
+                (status, stage, failure[0], failure[1], failure[2], failure[3], failure[4], confirmed, generation_id, now, task_id),
+            )
+            view = read_task_view(conn, task_id)
+            store_replay(conn, method="discard_revision", key=idempotency_key, payload=payload, task_id=task_id, view=view, now=now)
             return view
 
 
