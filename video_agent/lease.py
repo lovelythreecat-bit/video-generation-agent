@@ -53,13 +53,6 @@ def hold_lease(db, work_id: str, owner: str, clock, lease_seconds: int, *, sleep
                    WHERE work_id=? AND (lease_owner IS NULL OR lease_owner=?)""",
                 (owner, until, work_id, owner),
             )
-            conn.execute(
-                """UPDATE work_items
-                   SET lease_until=?
-                   WHERE done=1
-                     AND task_id=(SELECT task_id FROM work_items WHERE work_id=?)""",
-                (until, work_id),
-            )
         renewed = getattr(sleeper, "renewed", None)
         if isinstance(renewed, threading.Event):
             renewed.set()
