@@ -198,3 +198,41 @@ def test_resolve_home_uses_env_then_cwd(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     assert resolve_home() == tmp_path / ".video-agent"
     assert "VIDEO_AGENT_HOME" not in os.environ or os.environ.get("VIDEO_AGENT_HOME") != str(tmp_path / ".video-agent")
+
+
+def test_window_title_and_region_copy():
+    from pathlib import Path
+
+    from desktop_app.viewmodel import (
+        WINDOW_TITLE,
+        ffmpeg_label,
+        format_execution,
+        format_task_row,
+        home_label,
+        mode_label,
+    )
+    from video_agent.models import TaskSummary, TaskView
+
+    assert WINDOW_TITLE == "视频生成测试台"
+    assert ffmpeg_label(True) == "FFmpeg：可用"
+    assert ffmpeg_label(False) == "FFmpeg：缺少 FFmpeg"
+    assert mode_label("fake") == "模式：替身"
+    assert mode_label("real") == "模式：真实"
+    assert home_label(Path("D:/agent-data")) == "数据目录：D:/agent-data"
+    summary = TaskSummary(task_id="abc", status="succeeded", product_name="玻璃杯", updated_at="2026-10-09T00:00:00+00:00")
+    assert format_task_row(summary) == "玻璃杯  succeeded  abc"
+    unnamed = TaskSummary(task_id="abc", status="pending", product_name=None, updated_at="2026-10-09T00:00:00+00:00")
+    assert format_task_row(unnamed) == "未命名  pending  abc"
+    task = TaskView(
+        task_id="abc",
+        status="generating",
+        stage="generating_shots",
+        stage_detail="正在生成第 1 镜",
+        completed_shots=0,
+        total_shots=1,
+        updated_at="2026-10-09T00:00:00+00:00",
+    )
+    text = format_execution(task)
+    assert "generating_shots" in text
+    assert "0/1" in text
+    assert "正在生成第 1 镜" in text

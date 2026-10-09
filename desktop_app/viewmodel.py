@@ -5,7 +5,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from video_agent.models import TaskView
+from video_agent.models import TaskSummary, TaskView
 
 POLL_INTERVAL_MS = 1000
 IDLE_SLEEP_SECONDS = 1
@@ -150,3 +150,38 @@ def resolve_home() -> Path:
     if raw:
         return Path(raw)
     return Path.cwd() / ".video-agent"
+
+
+WINDOW_TITLE = "视频生成测试台"
+MODE_CHOICES = (("fake", "替身"), ("real", "真实"))
+
+
+def ffmpeg_label(available: bool) -> str:
+    if available:
+        return "FFmpeg：可用"
+    return "FFmpeg：缺少 FFmpeg"
+
+
+def mode_label(mode: str) -> str:
+    for key, text in MODE_CHOICES:
+        if key == mode:
+            return f"模式：{text}"
+    return f"模式：{mode}"
+
+
+def home_label(home: Path) -> str:
+    return f"数据目录：{home.as_posix()}"
+
+
+def format_task_row(summary: TaskSummary) -> str:
+    name = summary.product_name or "未命名"
+    return f"{name}  {summary.status}  {summary.task_id}"
+
+
+def format_execution(task: TaskView) -> str:
+    if task.completed_shots is None or task.total_shots is None:
+        shots = ""
+    else:
+        shots = f"{task.completed_shots}/{task.total_shots}"
+    return f"阶段：{task.stage or ''}\n已完成镜头：{shots}\n阶段说明：{task.stage_detail or ''}"
+
