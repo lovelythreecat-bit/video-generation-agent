@@ -30,6 +30,7 @@ from video_agent.models import (
     ProductInfo,
     RegenerateRequest,
     TaskView,
+    TickResult,
     VideoOptions,
 )
 from video_agent.state import (
@@ -602,6 +603,16 @@ class VideoAgent:
             view = read_task_view(conn, task_id)
             store_replay(conn, method="regenerate", key=idempotency_key, payload=payload, task_id=task_id, view=view, now=now)
             return view
+
+    def tick(self) -> TickResult:
+        from video_agent.worker import tick_once
+
+        return tick_once(self)
+
+    def recover(self) -> int:
+        from video_agent.worker import recover_expired
+
+        return recover_expired(self)
 
 
 def _blank_to_none(value: str | None) -> str | None:
