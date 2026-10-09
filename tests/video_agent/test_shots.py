@@ -301,6 +301,36 @@ def test_pending_query_defers_until_the_lease_expires(tmp_path: Path):
     assert video.queries == 2
 
 
+def test_import_without_external_id_marks_uncertain_before_fail(tmp_path: Path):
+    _need_ffmpeg()
+    video = RecordingVideo(Path("."))
+    agent, home, confirmed = _confirmed(tmp_path, video)
+    agent.tick()
+    assert _step(home, confirmed.generation_id)[0] == "submit_shot"
+    connection = sqlite3.connect(home / "agent.sqlite")
+    connection.execute(
+        """UPDATE generation_shots
+           SET submission_state='intended', external_task_id=NULL
+           WHERE generation_id=? AND shot_id='s1'""",
+        (confirmed.generation_id,),
+    )
+    connection.commit()
+    for _ in range(5):
+        view = agent.get_task(confirmed.task_id)
+        if view.status == "failed":
+            break
+        agent.tick()
+    view = agent.get_task(confirmed.task_id)
+    assert view.failure is not None
+    assert view.failure.code == "PROVIDER_SUBMISSION_UNCERTAIN"
+    stored = connection.execute(
+        """SELECT submission_state FROM generation_shots
+           WHERE generation_id=? AND shot_id='s1'""",
+        (confirmed.generation_id,),
+    ).fetchone()
+    assert stored == ("uncertain",)
+
+
 def test_two_shots_import_in_order(tmp_path: Path):
     _need_ffmpeg()
     video = RecordingVideo(Path("."))

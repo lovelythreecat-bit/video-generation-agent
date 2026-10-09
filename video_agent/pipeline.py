@@ -321,6 +321,14 @@ def _step_import_shot(agent, work: dict) -> None:
         _advance(agent, work, "audio")
         return
     if not shot["external_task_id"]:
+        _mark_submission(
+            agent,
+            work["generation_id"],
+            shot["shot_id"],
+            "uncertain",
+            None,
+            "pending",
+        )
         raise VideoAgentError(
             "PROVIDER_SUBMISSION_UNCERTAIN",
             "无法确认外部任务是否已经创建",
