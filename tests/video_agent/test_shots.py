@@ -319,8 +319,12 @@ def test_import_without_external_id_marks_uncertain_before_fail(tmp_path: Path):
     connection = sqlite3.connect(home / "agent.sqlite")
     connection.execute(
         """UPDATE generation_shots
-           SET submission_state='intended', external_task_id=NULL
+           SET submission_state=NULL, external_task_id=NULL, provider_idempotency_key=NULL
            WHERE generation_id=? AND shot_id='s1'""",
+        (confirmed.generation_id,),
+    )
+    connection.execute(
+        "UPDATE work_items SET step='import_shot' WHERE generation_id=?",
         (confirmed.generation_id,),
     )
     connection.commit()
@@ -333,11 +337,12 @@ def test_import_without_external_id_marks_uncertain_before_fail(tmp_path: Path):
     assert view.failure is not None
     assert view.failure.code == "PROVIDER_SUBMISSION_UNCERTAIN"
     stored = connection.execute(
-        """SELECT submission_state FROM generation_shots
+        """SELECT external_task_id FROM generation_shots
            WHERE generation_id=? AND shot_id='s1'""",
         (confirmed.generation_id,),
     ).fetchone()
-    assert stored == ("uncertain",)
+    assert stored[0] is None
+    assert video.seen == []
 
 
 def test_two_shots_import_in_order(tmp_path: Path):

@@ -89,6 +89,7 @@ class AlwaysTemporary(ScriptedPlanner):
 
 
 def test_tick_publishes_a_valid_plan_without_importing_pipeline(tmp_path: Path):
+    sys.modules.pop("video_agent.pipeline", None)
     planner = ScriptedPlanner(result=PlanResult(document=shot_document()))
     agent, clock = make(tmp_path, planner)
     assert agent.tick().did_work is False
