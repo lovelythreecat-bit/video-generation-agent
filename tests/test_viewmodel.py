@@ -441,3 +441,87 @@ def test_plan_and_artifact_text_include_contract_fields():
     assert "1080×1920" in line
     assert "not_assessed" in line
     assert parse_selling_points(" 耐热 \n\n透明\n") == ["耐热", "透明"]
+
+
+def test_settings_form_hides_secrets_and_patch_keeps_empty_string():
+    from desktop_app.viewmodel import (
+        AdapterEdit,
+        SettingsEdit,
+        adapter_field_map,
+        build_settings_patch,
+        fields_to_text,
+        is_secret_field,
+        parse_duration_tiers,
+        parse_field_lines,
+        redact_secret_fields,
+        settings_form_from_mapping,
+    )
+
+    assert is_secret_field("api_key") is True
+    assert is_secret_field("API_TOKEN") is True
+    assert is_secret_field("client_secret") is True
+    assert is_secret_field("model") is False
+    shown = redact_secret_fields({"api_key": "abc123", "model": "demo"})
+    assert shown == {"api_key": "", "model": "demo"}
+    text = fields_to_text(shown)
+    assert "abc123" not in text
+    assert parse_field_lines(text)["api_key"] == ""
+    assert parse_field_lines(text)["model"] == "demo"
+
+    class Adapter:
+        adapter = "fake"
+        api_key = "abc123"
+        model = "demo"
+
+    name, fields = adapter_field_map(Adapter())
+    assert name == "fake"
+    assert fields["api_key"] == "abc123"
+    assert adapter_field_map({"adapter": "fake", "fields": {"api_key": "abc123", "model": "demo"}})[1]["model"] == "demo"
+
+    config = {
+        "mode": "fake",
+        "duration_tiers": [5, 10, 15, 30],
+        "default_duration": 10,
+        "adapters": {
+            "planner": {"adapter": "fake", "api_key": "abc123", "model": "demo"},
+            "video": {"adapter": "fake"},
+            "voice": {"adapter": "fake"},
+            "music": {"adapter": "fake"},
+            "visual": {"adapter": "none"},
+        },
+    }
+    edit = settings_form_from_mapping(config)
+    assert "abc123" not in repr(edit)
+    assert edit.planner.fields["api_key"] == ""
+    assert edit.planner.fields["model"] == "demo"
+    assert edit.mode == "fake"
+    assert parse_duration_tiers("5, 10, 15, 30") == [5, 10, 15, 30]
+    patch = build_settings_patch(
+        SettingsEdit(
+            duration_tiers=[5, 10, 15],
+            default_duration=15,
+            mode="fake",
+            planner=AdapterEdit(adapter="fake", fields={"api_key": "", "model": "demo"}),
+            video=AdapterEdit(adapter="fake", fields={}),
+            voice=AdapterEdit(adapter="fake", fields={}),
+            music=AdapterEdit(adapter="fake", fields={}),
+            visual=AdapterEdit(adapter="none", fields={}),
+        )
+    )
+    assert set(patch.model_fields) == {
+        "duration_tiers",
+        "default_duration",
+        "mode",
+        "planner",
+        "video",
+        "voice",
+        "music",
+        "visual",
+    }
+    assert patch.planner.fields["api_key"] == ""
+    assert patch.default_duration == 15
+    dumped = patch.model_dump()
+    assert "video_bitrate" not in dumped
+    assert "resolutions" not in dumped
+    assert "max_images" not in dumped
+    assert "max_file_bytes" not in dumped

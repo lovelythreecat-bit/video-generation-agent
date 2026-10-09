@@ -405,3 +405,148 @@ def first_frame_asset_id(label: str) -> str | None:
     return label.split(" | ", 1)[1]
 
 
+from video_agent.config import AdapterSetting, SettingsPatch
+
+SETTINGS_ROLES = (
+    ("planner", "规划"),
+    ("video", "视频"),
+    ("voice", "配音"),
+    ("music", "音乐"),
+    ("visual", "视觉检查"),
+)
+_SECRET_MARKERS = ("key", "token", "secret")
+
+
+@dataclass
+class AdapterEdit:
+    adapter: str
+    fields: dict[str, str]
+
+
+@dataclass
+class SettingsEdit:
+    duration_tiers: list[int]
+    default_duration: int
+    mode: str
+    planner: AdapterEdit
+    video: AdapterEdit
+    voice: AdapterEdit
+    music: AdapterEdit
+    visual: AdapterEdit
+
+
+def is_secret_field(name: str) -> bool:
+    lowered = name.lower()
+    return any(marker in lowered for marker in _SECRET_MARKERS)
+
+
+def redact_secret_fields(fields: dict[str, str]) -> dict[str, str]:
+    shown = {}
+    for key, value in fields.items():
+        shown[key] = "" if is_secret_field(key) else value
+    return shown
+
+
+def _read(obj: object, name: str, default=None):
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def adapter_field_map(adapter_value: object) -> tuple[str, dict[str, str]]:
+    if adapter_value is None:
+        return "", {}
+    if isinstance(adapter_value, dict):
+        name = str(adapter_value.get("adapter", ""))
+        nested = adapter_value.get("fields")
+        raw = nested if isinstance(nested, dict) else adapter_value
+    else:
+        name = str(getattr(adapter_value, "adapter", ""))
+        nested = getattr(adapter_value, "fields", None)
+        if isinstance(nested, dict):
+            raw = nested
+        else:
+            extra = getattr(adapter_value, "model_extra", None) or {}
+            raw = {}
+            for key in dir(adapter_value):
+                if key.startswith("_"):
+                    continue
+                value = getattr(adapter_value, key, None)
+                if isinstance(value, str):
+                    raw[key] = value
+            for key, value in dict(extra).items():
+                if isinstance(value, str):
+                    raw[str(key)] = value
+    fields = {}
+    for key, value in raw.items():
+        if key in {"adapter", "fields"}:
+            continue
+        if isinstance(value, str):
+            fields[str(key)] = value
+    return name, fields
+
+
+def settings_form_from_mapping(config: object) -> SettingsEdit:
+    adapters = _read(config, "adapters")
+
+    def role(role_name: str) -> AdapterEdit:
+        adapter_name, fields = adapter_field_map(_read(adapters, role_name))
+        return AdapterEdit(adapter=adapter_name, fields=redact_secret_fields(fields))
+
+    return SettingsEdit(
+        duration_tiers=list(_read(config, "duration_tiers")),
+        default_duration=int(_read(config, "default_duration")),
+        mode=str(_read(config, "mode")),
+        planner=role("planner"),
+        video=role("video"),
+        voice=role("voice"),
+        music=role("music"),
+        visual=role("visual"),
+    )
+
+
+def fields_to_text(fields: dict[str, str]) -> str:
+    return "\n".join(f"{key}={value}" for key, value in fields.items())
+
+
+def parse_field_lines(text: str) -> dict[str, str]:
+    fields = {}
+    for line in text.splitlines():
+        if not line.strip() or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        fields[key.strip()] = value
+    return fields
+
+
+def parse_duration_tiers(text: str) -> list[int]:
+    return [int(part.strip()) for part in text.split(",") if part.strip()]
+
+
+def format_duration_tiers(tiers: list[int]) -> str:
+    return ",".join(str(item) for item in tiers)
+
+
+def mode_from_label(label: str) -> str:
+    for mode, text in MODE_CHOICES:
+        if label == text:
+            return mode
+    raise ValueError(label)
+
+
+def build_settings_patch(edit: SettingsEdit) -> SettingsPatch:
+    def one(item: AdapterEdit) -> AdapterSetting:
+        return AdapterSetting(adapter=item.adapter.strip(), fields=dict(item.fields))
+
+    return SettingsPatch(
+        duration_tiers=list(edit.duration_tiers),
+        default_duration=edit.default_duration,
+        mode=edit.mode,
+        planner=one(edit.planner),
+        video=one(edit.video),
+        voice=one(edit.voice),
+        music=one(edit.music),
+        visual=one(edit.visual),
+    )
+
+
