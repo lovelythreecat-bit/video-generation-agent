@@ -9,7 +9,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from video_agent.errors import VideoAgentError
-from video_agent.lease import hold_lease
+from video_agent.lease import MAX_AUTO_RETRIES, hold_lease
 import video_agent.media as media
 from video_agent.media import (
     _atempo_pad,
@@ -54,14 +54,59 @@ def advance_generation(agent, work_id: str) -> str:
     try:
         _dispatch(agent, work, step)
     except VideoAgentError as exc:
-        _fail(agent, work, exc)
+        _handle_generation_error(agent, work, exc)
     except Exception as exc:
-        _fail(
+        _handle_generation_error(
             agent,
             work,
             VideoAgentError("MEDIA_EXPORT_FAILED", str(exc), stage=_STAGE.get(step), retryable=True),
         )
     return step
+
+
+def _handle_generation_error(agent, work: dict, exc: VideoAgentError) -> None:
+    if exc.code in {"PROVIDER_TEMPORARY", "SHOT_DURATION_SHORT"} and _schedule_generation_retry(agent, work, exc):
+        return
+    _fail(agent, work, exc)
+
+
+def _schedule_generation_retry(agent, work: dict, exc: VideoAgentError) -> bool:
+    generation = _require_generation(agent, work["generation_id"])
+    used = int(generation["auto_attempts_used"])
+    if used >= MAX_AUTO_RETRIES:
+        return False
+    delay = 1.0
+    details = exc.details if isinstance(exc.details, dict) else {}
+    if "retry_after_seconds" in details:
+        try:
+            delay = float(details["retry_after_seconds"])
+        except (TypeError, ValueError):
+            delay = 1.0
+    if delay < 0:
+        delay = 1.0
+    later = (agent.clock.now() + timedelta(seconds=delay)).isoformat()
+    now = agent.clock.now().isoformat()
+    stage = exc.stage or _STAGE.get(str(work["step"]))
+    with _transaction(agent) as conn:
+        conn.execute(
+            """UPDATE generations
+               SET status='running', stage=?, auto_attempts_used=?, next_attempt_at=?, updated_at=?
+               WHERE generation_id=?""",
+            (stage, used + 1, later, now, work["generation_id"]),
+        )
+        conn.execute(
+            """UPDATE tasks
+               SET status='generating', stage=?, updated_at=?
+               WHERE task_id=?""",
+            (stage, now, work["task_id"]),
+        )
+        conn.execute(
+            """UPDATE work_items
+               SET done=0, lease_owner=NULL, lease_until=NULL, next_attempt_at=?
+               WHERE work_id=?""",
+            (later, work["work_id"]),
+        )
+    return True
 
 
 def _dispatch(agent, work: dict, step: str) -> None:
@@ -299,9 +344,45 @@ def _step_submit_shot(agent, work: dict) -> None:
     if shot is None:
         _advance(agent, work, "audio")
         return
-    if shot["submission_state"] in {"intended", "accepted", "uncertain"}:
+    if shot["submission_state"] in {"intended", "uncertain"}:
+        if _query_before_submit(agent, work, shot) != "submit":
+            return
+        shot = _next_shot(agent, work["generation_id"])
+        if shot is None:
+            _advance(agent, work, "audio")
+            return
+    elif shot["submission_state"] == "accepted":
         _advance(agent, work, "import_shot")
         return
+    _submit_new_shot(agent, work, shot)
+
+
+def _query_before_submit(agent, work: dict, shot: dict) -> str:
+    with hold_lease(agent.db, work["work_id"], agent.worker_owner, agent.clock, int(agent.config.lease_seconds)):
+        queried = agent.video.query(
+            external_task_id=shot["external_task_id"],
+            provider_idempotency_key=shot["provider_idempotency_key"],
+        )
+    if queried.state == "pending":
+        _defer(agent, work)
+        return "stop"
+    if queried.state == "absent":
+        _mark_submission(agent, work["generation_id"], shot["shot_id"], "absent", None, "pending")
+        return "submit"
+    if queried.state == "failed":
+        code = queried.error_code if queried.error_code in _ALLOWED else "PROVIDER_REJECTED"
+        raise VideoAgentError(
+            code,
+            queried.message or "镜头生成失败",
+            stage="generating_shots",
+            retryable=_RETRYABLE[code],
+            shot_ids=[shot["shot_id"]],
+        )
+    _advance(agent, work, "import_shot")
+    return "stop"
+
+
+def _submit_new_shot(agent, work: dict, shot: dict) -> None:
     generation = _require_generation(agent, work["generation_id"])
     document = PlanDocument.model_validate_json(generation["snapshot_json"])
     request = _shot_request(agent, work, shot, document)
@@ -320,14 +401,7 @@ def _step_submit_shot(agent, work: dict) -> None:
                 shot_ids=[shot["shot_id"]],
             ) from exc
     if result.uncertain or not result.external_task_id:
-        _mark_submission(
-            agent,
-            work["generation_id"],
-            shot["shot_id"],
-            "uncertain",
-            result.external_task_id,
-            "pending",
-        )
+        _mark_submission(agent, work["generation_id"], shot["shot_id"], "uncertain", None, "pending")
         raise VideoAgentError(
             "PROVIDER_SUBMISSION_UNCERTAIN",
             "无法确认外部任务是否已经创建",
@@ -335,14 +409,7 @@ def _step_submit_shot(agent, work: dict) -> None:
             retryable=True,
             shot_ids=[shot["shot_id"]],
         )
-    _mark_submission(
-        agent,
-        work["generation_id"],
-        shot["shot_id"],
-        "accepted",
-        result.external_task_id,
-        "submitted",
-    )
+    _mark_submission(agent, work["generation_id"], shot["shot_id"], "accepted", result.external_task_id, "submitted")
     _advance(agent, work, "import_shot")
 
 
@@ -402,6 +469,7 @@ def _step_import_shot(agent, work: dict) -> None:
     needed = int(shot["end_frame"]) - int(shot["start_frame"])
     info = probe(dest)
     if info.frame_count < needed:
+        dest.unlink(missing_ok=True)
         raise VideoAgentError(
             "SHOT_DURATION_SHORT",
             "模型片段短于镜头帧区间",

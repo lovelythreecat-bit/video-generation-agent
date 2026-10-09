@@ -262,26 +262,35 @@ def test_import_trims_long_clips_and_stops_before_audio(tmp_path: Path):
     assert status == ("running", 0)
 
 
-def test_short_clip_fails_without_using_auto_retries(tmp_path: Path):
+def test_short_clip_stays_running_after_the_first_short_download(tmp_path: Path):
     _need_ffmpeg()
     video = RecordingVideo(Path("."), extra_frames=-5)
     agent, home, confirmed = _confirmed(tmp_path, video)
-    for _ in range(8):
-        view = agent.get_task(confirmed.task_id)
-        if view.status == "failed":
+
+    def generation_row():
+        connection = sqlite3.connect(home / "agent.sqlite")
+        return connection.execute(
+            "SELECT status, auto_attempts_used, failure_code FROM generations WHERE generation_id=?",
+            (confirmed.generation_id,),
+        ).fetchone()
+
+    saw_backoff = False
+    for _ in range(12):
+        status, used, code = generation_row()
+        if status == "running" and used >= 1 and code is None:
+            saw_backoff = True
             break
-        agent.tick()
+        result = agent.tick()
+        if not result.did_work:
+            agent.clock.advance(1)
+    assert saw_backoff
+    status, used, code = generation_row()
+    assert status == "running"
+    assert used >= 1
+    assert code is None
     view = agent.get_task(confirmed.task_id)
-    assert view.failure is not None
-    assert view.failure.code == "SHOT_DURATION_SHORT"
-    assert view.failure.retryable is True
-    assert view.failure.stage == "generating_shots"
-    connection = sqlite3.connect(home / "agent.sqlite")
-    row = connection.execute(
-        "SELECT auto_attempts_used, failure_code FROM generations WHERE generation_id=?",
-        (confirmed.generation_id,),
-    ).fetchone()
-    assert row == (0, "SHOT_DURATION_SHORT")
+    assert view.status == "generating"
+    assert view.failure is None
 
 
 def test_pending_query_defers_until_the_lease_expires(tmp_path: Path):
