@@ -150,3 +150,76 @@ def test_revise_understands_tier_aspect_and_rejects_unknown_text():
     unknown = planner.revise(current, "随便写写", request)
     assert unknown.patch is None
     assert unknown.questions is None
+
+
+def _apply(document, patch):
+    from video_agent.state import apply_patch
+
+    return apply_patch(
+        document,
+        patch,
+        duration_tiers=[5, 10, 15, 30],
+        native_aspects=["9:16"],
+        image_asset_ids=["img-1"],
+        audio_asset_ids=set(),
+    )
+
+
+def test_explicit_audio_language_skips_conflict_and_detection():
+    from video_agent.fake_planner import FakePlanner
+
+    result = FakePlanner().plan(
+        _request(
+            product_info=ProductInfo(name="杯子"),
+            user_prompt="red cup on a table",
+            audio=AudioOptions(language="en"),
+        )
+    )
+    assert result.questions is None
+    assert result.document is not None
+    assert result.document.language == "en"
+
+
+def test_enabling_subtitles_fills_blank_copy_apply_patch_accepts():
+    from video_agent.fake_planner import FakePlanner
+
+    planner = FakePlanner()
+    request = _request(subtitles=False, voiceover=False, music=False)
+    current = planner.plan(request).document
+    assert current is not None
+    revised = planner.revise(current, "开启字幕", request)
+    assert revised.patch is not None
+    assert revised.patch.subtitles is True
+    assert revised.patch.shots is None
+    updated = _apply(current, revised.patch)
+    assert updated.subtitles is True
+    assert updated.shots[0].subtitle_text == "耐热"
+
+
+def test_enabling_voiceover_fills_blank_copy_apply_patch_accepts():
+    from video_agent.fake_planner import FakePlanner
+
+    planner = FakePlanner()
+    request = _request(subtitles=False, voiceover=False, music=False)
+    current = planner.plan(request).document
+    assert current is not None
+    revised = planner.revise(current, "开启配音", request)
+    assert revised.patch is not None
+    updated = _apply(current, revised.patch)
+    assert updated.voiceover is True
+    assert updated.shots[0].voiceover_text == "杯子"
+
+
+def test_enabling_music_with_empty_audio_sets_default_direction():
+    from video_agent.fake_planner import FakePlanner
+
+    planner = FakePlanner()
+    request = _request(subtitles=False, voiceover=False, music=False, audio=AudioOptions())
+    current = planner.plan(request).document
+    assert current is not None
+    revised = planner.revise(current, "开启音乐", request)
+    assert revised.patch is not None
+    assert revised.patch.music_direction == "平稳背景"
+    updated = _apply(current, revised.patch)
+    assert updated.music is True
+    assert updated.music_direction == "平稳背景"

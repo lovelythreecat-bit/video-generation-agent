@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 
-from video_agent.models import PlanDocument, PlanPatch, ProductInfo, SharedVisual, ShotPlan
+from video_agent.models import PlanDocument, PlanPatch, ProductInfo, SharedVisual, ShotPlan, ShotTextPatch
 from video_agent.ports import PlanRequest, PlanResult, ReviseResult
 
 _RATIOS = ("16:9", "9:16", "4:5", "3:4", "4:3", "3:2", "2:3", "1:1")
@@ -21,13 +21,15 @@ class FakePlanner:
         return "替身规划器只把 9:16 当作原生比例，其他比例使用 pad"
 
     def plan(self, request: PlanRequest) -> PlanResult:
-        if request.subtitles or request.voiceover:
+        explicit_language = request.audio.language
+        has_explicit_language = isinstance(explicit_language, str) and explicit_language.strip() != ""
+        if not has_explicit_language and (request.subtitles or request.voiceover):
             conflict = _language_conflict(request.product_info, request.user_prompt)
             if conflict is not None:
                 return PlanResult(questions=[conflict])
         product = request.product_info
-        subtitle = " ".join(product.selling_points) if product.selling_points else (product.name or "产品")
-        voice = product.name or subtitle
+        subtitle = _subtitle_copy(product)
+        voice = _voiceover_copy(product, subtitle)
         total = request.duration_seconds * 30
         native = request.aspect_ratio in request.video_capabilities.native_aspects
         music_on = request.music
@@ -67,13 +69,16 @@ class FakePlanner:
             first_frame_source="selected" if request.first_frame_asset_id else "generate",
             first_frame_asset_id=request.first_frame_asset_id,
             model_capabilities=_capabilities(self.capabilities_note(), request),
-            language=_language_of(_product_text(product)) or _language_of(request.user_prompt),
+            language=(
+                explicit_language
+                if has_explicit_language
+                else _language_of(_product_text(product)) or _language_of(request.user_prompt)
+            ),
             voice_preference=request.audio.voice_preference,
         )
         return PlanResult(document=document)
 
     def revise(self, current: PlanDocument, instruction: str, request: PlanRequest) -> ReviseResult:
-        del current
         text = instruction.strip()
         patch = PlanPatch()
         used = False
@@ -97,7 +102,41 @@ class FakePlanner:
                 used = True
         if not used:
             return ReviseResult()
+        _fill_enabled_switches(current, request, patch)
         return ReviseResult(patch=patch)
+
+
+def _subtitle_copy(product: ProductInfo) -> str:
+    return " ".join(product.selling_points) if product.selling_points else (product.name or "产品")
+
+
+def _voiceover_copy(product: ProductInfo, subtitle: str) -> str:
+    return product.name or subtitle
+
+
+def _fill_enabled_switches(current: PlanDocument, request: PlanRequest, patch: PlanPatch) -> None:
+    enabling_subtitles = patch.subtitles is True and not current.subtitles
+    enabling_voiceover = patch.voiceover is True and not current.voiceover
+    if enabling_subtitles or enabling_voiceover:
+        subtitle = _subtitle_copy(request.product_info)
+        voice = _voiceover_copy(request.product_info, subtitle)
+        texts: list[ShotTextPatch] = []
+        for shot in current.shots:
+            fields: dict[str, str] = {}
+            if enabling_subtitles and shot.subtitle_text.strip() == "":
+                fields["subtitle_text"] = subtitle
+            if enabling_voiceover and shot.voiceover_text.strip() == "":
+                fields["voiceover_text"] = voice
+            if fields:
+                texts.append(ShotTextPatch(shot_id=shot.shot_id, **fields))
+        if texts:
+            patch.shot_texts = texts
+    enabling_music = patch.music is True and not current.music
+    if enabling_music and current.music_direction.strip() == "" and not current.music_asset_id:
+        direction = request.audio.music_direction.strip()
+        patch.music_direction = direction or "平稳背景"
+        if request.audio.music_asset_id:
+            patch.music_asset_id = request.audio.music_asset_id
 
 
 def _product_text(info: ProductInfo) -> str:
