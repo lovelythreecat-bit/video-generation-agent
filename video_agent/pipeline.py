@@ -50,6 +50,7 @@ _DETAIL = {
 
 def advance_generation(agent, work_id: str) -> str:
     work = _load_work(agent, work_id)
+    _drop_finished_siblings(agent, work)
     _sync_config_without_external_id(agent, work)
     work = _load_work(agent, work_id)
     step = str(work["step"])
@@ -64,6 +65,14 @@ def advance_generation(agent, work_id: str) -> str:
             VideoAgentError("MEDIA_EXPORT_FAILED", str(exc), stage=_STAGE.get(step), retryable=True),
         )
     return step
+
+
+def _drop_finished_siblings(agent, work: dict) -> None:
+    with _transaction(agent) as conn:
+        conn.execute(
+            "DELETE FROM work_items WHERE task_id=? AND work_id!=? AND done=1",
+            (work["task_id"], work["work_id"]),
+        )
 
 
 def _sync_config_without_external_id(agent, work: dict) -> None:
