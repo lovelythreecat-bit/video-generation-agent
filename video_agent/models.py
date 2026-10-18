@@ -171,6 +171,21 @@ class TaskSummary(BaseModel):
     updated_at: str
 
 
+class TaskPage(BaseModel):
+    items: list[TaskSummary]
+    limit: int
+    offset: int
+    total: int
+
+
+class AssetView(BaseModel):
+    asset_id: str
+    kind: Literal["image", "audio"]
+    filename: str
+    media_type: str
+    byte_size: int
+
+
 class PlanView(BaseModel):
     task_id: str
     plan_version: int
@@ -206,6 +221,7 @@ class ArtifactView(BaseModel):
     width: int
     height: int
     quality_status: Literal["passed", "flagged", "not_assessed"]
+    visual_check_enabled: bool | None = None
     quality: dict
     created_at: str
 

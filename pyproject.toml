@@ -5,10 +5,18 @@ requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2",
     "pillow>=10",
+    "fastapi>=0.115.12",
+    "starlette>=0.49.1",
+    "uvicorn>=0.30",
+    "sqlalchemy>=2.0.41",
+    "pymysql>=1.1.1",
+    "alembic>=1.13",
+    "cryptography>=43",
+    "python-multipart>=0.0.18",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest"]
+dev = ["pytest", "httpx>=0.27"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
@@ -19,4 +27,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["video_agent*"]
+include = ["video_agent*", "api_app*", "desktop_app*"]
+
+[tool.setuptools.package-data]
+api_app = ["static/docs/*"]

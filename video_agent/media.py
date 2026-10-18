@@ -88,11 +88,11 @@ def fit_image(image: Path, fit: Literal["native", "pad", "crop"], width: int, he
     canvas.save(dest, format="PNG")
 
 
-def concat_clips(clips: list[Path], dest: Path) -> None:
+def concat_clips(clips: list[Path], dest: Path, *, keep_audio: bool = False) -> None:
     if not clips:
         raise VideoAgentError("MEDIA_EXPORT_FAILED", "没有可拼接的镜头", retryable=True)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if len(clips) == 1:
+    if len(clips) == 1 and (keep_audio or not probe(clips[0]).has_audio):
         shutil.copyfile(clips[0], dest)
         return
     listing = dest.with_suffix(".concat.txt")
@@ -106,7 +106,8 @@ def concat_clips(clips: list[Path], dest: Path) -> None:
             "-pix_fmt", "yuv420p",
             "-preset", "ultrafast",
             "-fps_mode", "passthrough",
-            "-an",
+            *( [] if keep_audio else ["-an"] ),
+            *( _audio_args(192000) if keep_audio else [] ),
             str(dest),
         ]
     )
@@ -136,11 +137,15 @@ def burn_subtitles(
     dest: Path,
     *,
     video_bitrate: int,
+    keep_audio: bool = False,
 ) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     visible = [cue for cue in cues if cue.text.strip()]
     if not visible:
-        _encode_video(video, dest, video_bitrate)
+        if keep_audio:
+            encode_av(video, dest, video_bitrate, 192000)
+        else:
+            _encode_video(video, dest, video_bitrate)
         return
     family, _path = _font_file("".join(cue.text for cue in visible))
     events = []
@@ -170,7 +175,8 @@ def burn_subtitles(
             "-preset", "ultrafast",
             "-r", "30",
             "-b:v", str(video_bitrate),
-            "-an",
+            *([] if keep_audio else ["-an"]),
+            *(_audio_args(192000) if keep_audio else []),
             str(dest),
         ]
     )
@@ -517,6 +523,10 @@ def _filter_path(path: Path) -> str:
 
 def _encode_video(src: Path, dest: Path, video_bitrate: int) -> None:
     _run_ffmpeg(["-i", str(src), *_video_args(video_bitrate), "-an", str(dest)])
+
+
+def encode_av(src: Path, dest: Path, video_bitrate: int, audio_bitrate: int) -> None:
+    _run_ffmpeg(["-i", str(src), *_video_args(video_bitrate), *_audio_args(audio_bitrate), str(dest)])
 
 
 def _encode_audio(src: Path, dest: Path, audio_bitrate: int) -> None:

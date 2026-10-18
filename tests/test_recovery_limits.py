@@ -130,7 +130,7 @@ def test_missing_asset_does_not_resubmit_the_video_model(tmp_path: Path):
     for _ in range(12):
         step = read_rows(
             agent.home,
-            "SELECT step FROM work_items WHERE task_id=? ORDER BY ready_at DESC LIMIT 1",
+            "SELECT step FROM work_items WHERE task_id=? AND kind='generation' ORDER BY ready_at DESC LIMIT 1",
             (task.task_id,),
         )[0]["step"]
         if step == "audio":

@@ -1,7 +1,7 @@
 import io
 import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Literal
 
 from PIL import Image, UnidentifiedImageError
@@ -25,6 +25,8 @@ class LocalFileStore:
 
     def path_for(self, relative_path: str) -> Path:
         root = self.home.resolve()
+        if Path(relative_path).is_absolute() or PureWindowsPath(relative_path).drive or PureWindowsPath(relative_path).root or ":" in relative_path or any(ord(char) < 32 for char in relative_path):
+            raise VideoAgentError("VALIDATION_ERROR", "只接受相对文件路径")
         target = (self.home / relative_path).resolve()
         if not target.is_relative_to(root):
             raise VideoAgentError("VALIDATION_ERROR", "文件路径越界")
@@ -54,9 +56,9 @@ class LocalFileStore:
     ) -> StoredAsset:
         if kind not in ("image", "audio"):
             raise VideoAgentError("VALIDATION_ERROR", "种类只能是 image 或 audio", fields=["kind"])
-        name = Path(filename).name
-        if name in {"", ".", ".."}:
-            raise VideoAgentError("VALIDATION_ERROR", "文件名不能为空", fields=["filename"])
+        name = filename.replace("\\", "/").rsplit("/", 1)[-1]
+        if name in {"", ".", ".."} or len(name.encode("utf-8")) > 255 or any(ord(char) < 32 or char in '<>:"|?*' for char in name) or name.endswith((" ", ".")) or name.split(".", 1)[0].upper() in {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}:
+            raise VideoAgentError("VALIDATION_ERROR", "文件名无效", fields=["filename"])
         if len(data) < 1 or len(data) > max_bytes:
             raise VideoAgentError("VALIDATION_ERROR", "文件超过大小限制或为空", fields=["data"])
         media_type = _media_type(kind, data)

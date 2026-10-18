@@ -87,6 +87,10 @@ def button_states(
         confirm = head_open and ffmpeg_available
         discard_revision = head_open and has_confirmed_plan
 
+    if has_head and not head_confirmed:
+        regenerate_full = False
+        regenerate_shots = False
+
     return ButtonStates(
         create=ffmpeg_available,
         submit_inputs=submit_inputs,
@@ -145,6 +149,10 @@ def question_text(task: TaskView | None) -> str:
 
 def error_dialog_text(code: str, message: str, stage: str | None) -> str:
     return f"{code}\n{message}\n{stage or ''}"
+
+
+def failure_clipboard_text(code: str, message: str, stage: str) -> str:
+    return f"错误码：{code}\n说明：{message}\n阶段：{stage}"
 
 
 def should_poll(status: str | None) -> bool:
@@ -375,7 +383,7 @@ def format_plan(plan: PlanView) -> str:
         f"人物：{visual.character or ''}",
         f"换景：{visual.scene_change or ''}",
         f"首帧来源：{doc.first_frame_source}  素材：{doc.first_frame_asset_id or ''}",
-        f"比例适配：{doc.fit}  字幕：{doc.subtitles}  配音：{doc.voiceover}  音乐：{doc.music}",
+        f"比例适配：{doc.fit}  字幕：{doc.subtitles}  声音：{'有声' if doc.voiceover or doc.music else '无声'}",
         f"时长：{doc.duration_seconds}  比例：{doc.aspect_ratio}",
         f"模型能力：{doc.model_capabilities}",
     ]

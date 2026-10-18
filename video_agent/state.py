@@ -1,5 +1,6 @@
 import json
-import sqlite3
+from collections.abc import Mapping
+from video_agent.db import Connection
 import uuid
 
 from video_agent.config import ASPECT_RATIOS
@@ -12,12 +13,12 @@ def dumps(value: object) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def has_plan(conn: sqlite3.Connection, task_id: str) -> bool:
-    row = conn.execute("SELECT 1 AS ok FROM plan_versions WHERE task_id=? LIMIT 1", (task_id,)).fetchone()
+def has_plan(conn: Connection, task_id: str) -> bool:
+    row = conn.execute('SELECT 1 AS ok FROM plan_versions WHERE task_id=:task_id LIMIT 1', {'task_id': task_id}).fetchone()
     return row is not None
 
 
-def assert_mutation_allowed(task: sqlite3.Row, method: str, *, has_plan: bool) -> None:
+def assert_mutation_allowed(task: Mapping[str, object], method: str, *, has_plan: bool) -> None:
     status = task["status"]
     scope = task["failure_scope"]
     confirmed = task["confirmed_plan_version"] is not None
@@ -65,7 +66,7 @@ def assert_mutation_allowed(task: sqlite3.Row, method: str, *, has_plan: bool) -
     deny()
 
 
-def task_row_to_view(row: sqlite3.Row) -> TaskView:
+def task_row_to_view(row: Mapping[str, object]) -> TaskView:
     status = row["status"]
     stage = row["stage"] if status in {"planning", "generating", "failed"} else None
     failure = None
@@ -106,19 +107,19 @@ def task_row_to_view(row: sqlite3.Row) -> TaskView:
     )
 
 
-def read_task_row(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row:
-    row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+def read_task_row(conn: Connection, task_id: str) -> Mapping[str, object]:
+    row = conn.execute(conn.for_update('SELECT * FROM tasks WHERE task_id=:task_id'), {'task_id': task_id}).fetchone()
     if row is None:
         raise VideoAgentError("NOT_FOUND", "任务不存在", task_id=task_id)
     return row
 
 
-def read_task_view(conn: sqlite3.Connection, task_id: str) -> TaskView:
+def read_task_view(conn: Connection, task_id: str) -> TaskView:
     return task_row_to_view(read_task_row(conn, task_id))
 
 
 def insert_work(
-    conn: sqlite3.Connection,
+    conn: Connection,
     *,
     task_id: str,
     kind: str,
@@ -132,42 +133,43 @@ def insert_work(
         """INSERT INTO work_items (
             work_id, task_id, kind, generation_id, ready_at, lease_owner, lease_until,
             copied_config_json, step, next_attempt_at, done
-        ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, 0)""",
-        (work_id, task_id, kind, generation_id, ready_at, dumps(copied_config), step),
+        ) VALUES (:work_id, :task_id, :kind, :generation_id, :ready_at, NULL, NULL, :dumps_copied_config, :step, NULL, 0)""",
+        {'work_id': work_id, 'task_id': task_id, 'kind': kind, 'generation_id': generation_id, 'ready_at': ready_at, 'dumps_copied_config': dumps(copied_config), 'step': step},
     )
     return work_id
 
 
-def load_plan_document(conn: sqlite3.Connection, task_id: str, plan_version: int) -> PlanDocument:
+def load_plan_document(conn: Connection, task_id: str, plan_version: int) -> PlanDocument:
     row = conn.execute(
-        "SELECT document_json FROM plan_versions WHERE task_id=? AND plan_version=?",
-        (task_id, plan_version),
+        'SELECT document_json FROM plan_versions WHERE task_id=:task_id AND plan_version=:plan_version',
+        {'task_id': task_id, 'plan_version': plan_version},
     ).fetchone()
     if row is None:
         raise VideoAgentError("NOT_FOUND", "方案不存在", task_id=task_id, plan_version=plan_version)
     return PlanDocument.model_validate_json(row["document_json"])
 
 
-def publish_document(conn: sqlite3.Connection, *, task_id: str, document: PlanDocument, now: str) -> int:
+def publish_document(conn: Connection, *, task_id: str, document: PlanDocument, now: str) -> int:
+    read_task_row(conn, task_id)
     row = conn.execute(
-        "SELECT COALESCE(MAX(plan_version), 0) + 1 AS n FROM plan_versions WHERE task_id=?",
-        (task_id,),
+        'SELECT COALESCE(MAX(plan_version), 0) + 1 AS n FROM plan_versions WHERE task_id=:task_id',
+        {'task_id': task_id},
     ).fetchone()
     version = int(row["n"])
     conn.execute(
         """INSERT INTO plan_versions (task_id, plan_version, document_json, abandoned, created_at)
-           VALUES (?, ?, ?, 0, ?)""",
-        (task_id, version, document.model_dump_json(), now),
+           VALUES (:task_id, :version, :document_json, 0, :now)""",
+        {'task_id': task_id, 'version': version, 'document_json': document.model_dump_json(), 'now': now},
     )
     conn.execute(
         """UPDATE tasks SET
             status='awaiting_confirmation', stage=NULL, stage_detail=NULL,
             failure_scope=NULL, failure_code=NULL, failure_message=NULL,
             failure_stage=NULL, failure_retryable=NULL, failure_details_json=NULL,
-            questions_json='[]', head_plan_version=?, pending_instruction=NULL,
-            completed_shots=NULL, total_shots=NULL, updated_at=?
-           WHERE task_id=?""",
-        (version, now, task_id),
+            questions_json='[]', head_plan_version=:version, pending_instruction=NULL,
+            completed_shots=NULL, total_shots=NULL, updated_at=:now
+           WHERE task_id=:task_id""",
+        {'version': version, 'now': now, 'task_id': task_id},
     )
     return version
 
@@ -301,26 +303,26 @@ def apply_patch(
     )
 
 
-def refresh_generation_pointer(conn: sqlite3.Connection, task_id: str) -> None:
+def refresh_generation_pointer(conn: Connection, task_id: str) -> None:
     row = conn.execute(
         """SELECT generation_id FROM generations
-           WHERE task_id=? AND status IN ('queued', 'running')
+           WHERE task_id=:task_id AND status IN ('queued', 'running')
            ORDER BY created_at ASC, generation_id ASC LIMIT 1""",
-        (task_id,),
+        {'task_id': task_id},
     ).fetchone()
     if row is None:
         row = conn.execute(
             """SELECT generation_id FROM generations
-               WHERE task_id=?
+               WHERE task_id=:task_id
                ORDER BY created_at DESC, generation_id DESC LIMIT 1""",
-            (task_id,),
+            {'task_id': task_id},
         ).fetchone()
     generation_id = None if row is None else row["generation_id"]
-    conn.execute("UPDATE tasks SET generation_id=? WHERE task_id=?", (generation_id, task_id))
+    conn.execute('UPDATE tasks SET generation_id=:generation_id WHERE task_id=:task_id', {'generation_id': generation_id, 'task_id': task_id})
 
 
 def start_generation(
-    conn: sqlite3.Connection,
+    conn: Connection,
     *,
     task_id: str,
     plan_version: int,
@@ -344,27 +346,15 @@ def start_generation(
             generation_id, task_id, plan_version, kind, shot_ids_json, base_artifact_id,
             status, stage, completed_shots, total_shots, snapshot_json, copied_config_json,
             auto_attempts_used, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'queued', 'queued', 0, ?, ?, ?, 0, ?, ?)""",
-        (
-            generation_id,
-            task_id,
-            plan_version,
-            kind,
-            dumps(shot_ids),
-            base_artifact_id,
-            len(shot_ids),
-            document.model_dump_json(),
-            dumps(copied_config),
-            now,
-            now,
-        ),
+        ) VALUES (:generation_id, :task_id, :plan_version, :kind, :dumps_shot_ids, :base_artifact_id, 'queued', 'queued', 0, :len_shot_ids, :document_json, :dumps_copied_config, 0, :now, :now_2)""",
+        {'generation_id': generation_id, 'task_id': task_id, 'plan_version': plan_version, 'kind': kind, 'dumps_shot_ids': dumps(shot_ids), 'base_artifact_id': base_artifact_id, 'len_shot_ids': len(shot_ids), 'document_json': document.model_dump_json(), 'dumps_copied_config': dumps(copied_config), 'now': now, 'now_2': now},
     )
     for ordinal, shot in enumerate(chosen):
         conn.execute(
             """INSERT INTO generation_shots (
                 generation_id, shot_id, ordinal, start_frame, end_frame, status
-            ) VALUES (?, ?, ?, ?, ?, 'pending')""",
-            (generation_id, shot.shot_id, ordinal, shot.start_frame, shot.end_frame),
+            ) VALUES (:generation_id, :shot_shot_id, :ordinal, :shot_start_frame, :shot_end_frame, 'pending')""",
+            {'generation_id': generation_id, 'shot_shot_id': shot.shot_id, 'ordinal': ordinal, 'shot_start_frame': shot.start_frame, 'shot_end_frame': shot.end_frame},
         )
     if confirm_version is None:
         conn.execute(
@@ -372,10 +362,10 @@ def start_generation(
                 status='generating', stage='queued', stage_detail=NULL,
                 failure_scope=NULL, failure_code=NULL, failure_message=NULL,
                 failure_stage=NULL, failure_retryable=NULL, failure_details_json=NULL,
-                questions_json='[]', generation_id=?, pending_instruction=NULL,
-                completed_shots=0, total_shots=?, updated_at=?
-               WHERE task_id=?""",
-            (generation_id, len(shot_ids), now, task_id),
+                questions_json='[]', generation_id=:generation_id, pending_instruction=NULL,
+                completed_shots=0, total_shots=:len_shot_ids, updated_at=:now
+               WHERE task_id=:task_id""",
+            {'generation_id': generation_id, 'len_shot_ids': len(shot_ids), 'now': now, 'task_id': task_id},
         )
     else:
         conn.execute(
@@ -383,10 +373,10 @@ def start_generation(
                 status='generating', stage='queued', stage_detail=NULL,
                 failure_scope=NULL, failure_code=NULL, failure_message=NULL,
                 failure_stage=NULL, failure_retryable=NULL, failure_details_json=NULL,
-                questions_json='[]', confirmed_plan_version=?, generation_id=?,
-                pending_instruction=NULL, completed_shots=0, total_shots=?, updated_at=?
-               WHERE task_id=?""",
-            (confirm_version, generation_id, len(shot_ids), now, task_id),
+                questions_json='[]', confirmed_plan_version=:confirm_version, generation_id=:generation_id,
+                pending_instruction=NULL, completed_shots=0, total_shots=:len_shot_ids, updated_at=:now
+               WHERE task_id=:task_id""",
+            {'confirm_version': confirm_version, 'generation_id': generation_id, 'len_shot_ids': len(shot_ids), 'now': now, 'task_id': task_id},
         )
     insert_work(
         conn,
@@ -400,64 +390,56 @@ def start_generation(
     return generation_id
 
 
-def mark_generation_succeeded(conn: sqlite3.Connection, generation_id: str, now: str) -> None:
-    generation = conn.execute("SELECT * FROM generations WHERE generation_id=?", (generation_id,)).fetchone()
+def mark_generation_succeeded(conn: Connection, generation_id: str, now: str) -> None:
+    generation = conn.execute('SELECT * FROM generations WHERE generation_id=:generation_id', {'generation_id': generation_id}).fetchone()
     if generation is None:
         raise VideoAgentError("NOT_FOUND", "执行不存在", generation_id=generation_id)
     conn.execute(
         """UPDATE generations SET
             status='succeeded', failure_code=NULL, failure_message=NULL,
-            failure_stage=NULL, failure_retryable=NULL, failure_details_json=NULL, updated_at=?
-           WHERE generation_id=?""",
-        (now, generation_id),
+            failure_stage=NULL, failure_retryable=NULL, failure_details_json=NULL, updated_at=:now
+           WHERE generation_id=:generation_id""",
+        {'now': now, 'generation_id': generation_id},
     )
     task = read_task_row(conn, generation["task_id"])
     status = "succeeded" if task["head_plan_version"] == generation["plan_version"] else "awaiting_confirmation"
     conn.execute(
         """UPDATE tasks SET
-            status=?, stage=NULL, stage_detail=NULL,
+            status=:status, stage=NULL, stage_detail=NULL,
             failure_scope=NULL, failure_code=NULL, failure_message=NULL,
             failure_stage=NULL, failure_retryable=NULL, failure_details_json=NULL,
-            completed_shots=NULL, total_shots=NULL, updated_at=?
-           WHERE task_id=?""",
-        (status, now, generation["task_id"]),
+            completed_shots=NULL, total_shots=NULL, updated_at=:now
+           WHERE task_id=:generation_task_id""",
+        {'status': status, 'now': now, 'generation_task_id': generation["task_id"]},
     )
     refresh_generation_pointer(conn, generation["task_id"])
 
 
-def mark_generation_failed(conn: sqlite3.Connection, generation_id: str, failure: FailureView, now: str) -> None:
-    generation = conn.execute("SELECT * FROM generations WHERE generation_id=?", (generation_id,)).fetchone()
+def mark_generation_failed(conn: Connection, generation_id: str, failure: FailureView, now: str) -> None:
+    generation = conn.execute('SELECT * FROM generations WHERE generation_id=:generation_id', {'generation_id': generation_id}).fetchone()
     if generation is None:
         raise VideoAgentError("NOT_FOUND", "执行不存在", generation_id=generation_id)
     stage = failure.stage or generation["stage"]
     conn.execute(
         """UPDATE generations SET
-            status='failed', stage=?, failure_code=?, failure_message=?, failure_stage=?,
-            failure_retryable=?, updated_at=?
-           WHERE generation_id=?""",
-        (stage, failure.code, failure.message, failure.stage, 1 if failure.retryable else 0, now, generation_id),
+            status='failed', stage=:stage, failure_code=:failure_code, failure_message=:failure_message, failure_stage=:failure_stage,
+            failure_retryable=:value_1_if_failure_retryable_else_0, updated_at=:now
+           WHERE generation_id=:generation_id""",
+        {'stage': stage, 'failure_code': failure.code, 'failure_message': failure.message, 'failure_stage': failure.stage, 'value_1_if_failure_retryable_else_0': 1 if failure.retryable else 0, 'now': now, 'generation_id': generation_id},
     )
     conn.execute(
         """UPDATE tasks SET
-            status='failed', stage=?, stage_detail=NULL, failure_scope='generation',
-            failure_code=?, failure_message=?, failure_stage=?, failure_retryable=?,
-            completed_shots=NULL, total_shots=NULL, updated_at=?
-           WHERE task_id=?""",
-        (
-            stage,
-            failure.code,
-            failure.message,
-            failure.stage,
-            1 if failure.retryable else 0,
-            now,
-            generation["task_id"],
-        ),
+            status='failed', stage=:stage, stage_detail=NULL, failure_scope='generation',
+            failure_code=:failure_code, failure_message=:failure_message, failure_stage=:failure_stage, failure_retryable=:value_1_if_failure_retryable_else_0,
+            completed_shots=NULL, total_shots=NULL, updated_at=:now
+           WHERE task_id=:generation_task_id""",
+        {'stage': stage, 'failure_code': failure.code, 'failure_message': failure.message, 'failure_stage': failure.stage, 'value_1_if_failure_retryable_else_0': 1 if failure.retryable else 0, 'now': now, 'generation_task_id': generation["task_id"]},
     )
     refresh_generation_pointer(conn, generation["task_id"])
 
 
 def record_artifact(
-    conn: sqlite3.Connection,
+    conn: Connection,
     *,
     task_id: str,
     generation_id: str,
@@ -471,27 +453,14 @@ def record_artifact(
     quality: dict,
     now: str,
 ) -> str:
-    row = conn.execute("SELECT COALESCE(MAX(version), 0) + 1 AS n FROM artifacts WHERE task_id=?", (task_id,)).fetchone()
+    read_task_row(conn, task_id)
+    row = conn.execute('SELECT COALESCE(MAX(version), 0) + 1 AS n FROM artifacts WHERE task_id=:task_id', {'task_id': task_id}).fetchone()
     artifact_id = str(uuid.uuid4())
     conn.execute(
         """INSERT INTO artifacts (
             artifact_id, task_id, generation_id, plan_version, version, duration_seconds,
             aspect_ratio, width, height, relative_path, quality_status, quality_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (
-            artifact_id,
-            task_id,
-            generation_id,
-            plan_version,
-            int(row["n"]),
-            duration_seconds,
-            aspect_ratio,
-            width,
-            height,
-            relative_path,
-            quality_status,
-            dumps(quality),
-            now,
-        ),
+        ) VALUES (:artifact_id, :task_id, :generation_id, :plan_version, :int_n, :duration_seconds, :aspect_ratio, :width, :height, :relative_path, :quality_status, :dumps_quality, :now)""",
+        {'artifact_id': artifact_id, 'task_id': task_id, 'generation_id': generation_id, 'plan_version': plan_version, 'int_n': int(row["n"]), 'duration_seconds': duration_seconds, 'aspect_ratio': aspect_ratio, 'width': width, 'height': height, 'relative_path': relative_path, 'quality_status': quality_status, 'dumps_quality': dumps(quality), 'now': now},
     )
     return artifact_id

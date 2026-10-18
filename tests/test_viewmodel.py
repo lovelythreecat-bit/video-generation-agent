@@ -38,6 +38,7 @@ CASES = [
     ("awaiting_confirmation", dict(status="awaiting_confirmation"), "1 0 1 1 0 0 0 0 0 0"),
     ("awaiting_confirmation_confirmed", dict(status="awaiting_confirmation", has_confirmed_plan=True), "1 0 1 1 1 1 0 0 0 0"),
     ("awaiting_confirmation_artifact", dict(status="awaiting_confirmation", has_confirmed_plan=True, has_successful_artifact=True), "1 0 1 1 1 1 1 0 0 1"),
+    ("awaiting_confirmation_draft", dict(status="awaiting_confirmation", has_head=True, has_confirmed_plan=True, has_successful_artifact=True), "1 0 1 1 1 0 0 0 0 1"),
     ("awaiting_confirmation_no_ffmpeg", dict(status="awaiting_confirmation", has_confirmed_plan=True, has_successful_artifact=True, ffmpeg_available=False), "0 0 1 0 1 0 0 0 0 1"),
     ("succeeded", dict(status="succeeded", has_confirmed_plan=True, has_successful_artifact=True), "1 0 1 0 0 1 1 0 0 1"),
     ("succeeded_no_artifact", dict(status="succeeded", has_confirmed_plan=True), "1 0 1 0 0 1 0 0 0 0"),
@@ -48,8 +49,8 @@ CASES = [
     ("failed_planning_no_head_confirmed", dict(status="failed", failure_scope="planning", has_confirmed_plan=True), "1 1 0 0 1 0 0 1 0 0"),
     ("failed_planning_no_ffmpeg", dict(status="failed", failure_scope="planning", ffmpeg_available=False), "0 1 0 0 0 0 0 1 0 0"),
     ("failed_generation_head_confirmed", dict(status="failed", failure_scope="generation", has_head=True, head_confirmed=True, has_confirmed_plan=True, has_successful_artifact=True), "1 0 1 0 0 1 1 0 1 1"),
-    ("failed_generation_head_open", dict(status="failed", failure_scope="generation", has_head=True, has_confirmed_plan=True, has_successful_artifact=True), "1 0 1 1 1 1 1 0 1 1"),
-    ("failed_generation_no_artifact", dict(status="failed", failure_scope="generation", has_head=True, has_confirmed_plan=True), "1 0 1 1 1 1 0 0 1 0"),
+    ("failed_generation_head_open", dict(status="failed", failure_scope="generation", has_head=True, has_confirmed_plan=True, has_successful_artifact=True), "1 0 1 1 1 0 0 0 1 1"),
+    ("failed_generation_no_artifact", dict(status="failed", failure_scope="generation", has_head=True, has_confirmed_plan=True), "1 0 1 1 1 0 0 0 1 0"),
     ("failed_generation_no_confirmed", dict(status="failed", failure_scope="generation", has_head=True), "1 0 1 1 0 0 0 0 1 0"),
     ("failed_generation_no_ffmpeg", dict(status="failed", failure_scope="generation", has_head=True, has_confirmed_plan=True, has_successful_artifact=True, ffmpeg_available=False), "0 0 1 0 1 0 0 0 0 1"),
     ("pending", dict(status="pending", has_head=True, has_confirmed_plan=True, has_successful_artifact=True), "1 0 0 0 0 0 0 0 0 1"),
@@ -106,7 +107,8 @@ def test_button_states_for_reads_only_task_fields():
     assert got.confirm is True
     assert got.discard_revision is True
     assert got.retry_generation is True
-    assert got.regenerate_shots is True
+    assert got.regenerate_full is False
+    assert got.regenerate_shots is False
 
     same = _task("failed", failure_scope="generation", head_plan_version=2, confirmed_plan_version=2)
     locked = button_states_for(same, has_successful_artifact=True, ffmpeg_available=True)
@@ -158,6 +160,12 @@ def test_error_dialog_text_includes_code_message_stage():
 
     assert error_dialog_text("VALIDATION_ERROR", "时长不在档位内", "planning") == "VALIDATION_ERROR\n时长不在档位内\nplanning"
     assert error_dialog_text("NOT_FOUND", "没有这条任务", None) == "NOT_FOUND\n没有这条任务\n"
+
+
+def test_failure_clipboard_text_uses_field_labels():
+    from desktop_app.viewmodel import failure_clipboard_text
+
+    assert failure_clipboard_text("VALIDATION_ERROR", "时长不在档位内", "planning") == "错误码：VALIDATION_ERROR\n说明：时长不在档位内\n阶段：planning"
 
 
 def test_poll_interval_and_idle_sleep():
@@ -508,7 +516,7 @@ def test_settings_form_hides_secrets_and_patch_keeps_empty_string():
             visual=AdapterEdit(adapter="none", fields={}),
         )
     )
-    assert set(patch.model_fields) == {
+    assert patch.model_fields_set == {
         "duration_tiers",
         "default_duration",
         "mode",
@@ -520,7 +528,7 @@ def test_settings_form_hides_secrets_and_patch_keeps_empty_string():
     }
     assert patch.planner.fields["api_key"] == ""
     assert patch.default_duration == 15
-    dumped = patch.model_dump()
+    dumped = patch.model_dump(exclude_unset=True)
     assert "video_bitrate" not in dumped
     assert "resolutions" not in dumped
     assert "max_images" not in dumped

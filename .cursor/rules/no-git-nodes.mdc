@@ -1,0 +1,29 @@
+---
+description: 未经用户当次明确允许，不要创建 Git 节点
+alwaysApply: true
+---
+
+# 不要擅自创建 Git 节点
+
+未经用户在当次对话里明确允许，不要创建 Git 节点。改动直接写在当前工作区的文件里。
+
+Git 节点包括：
+
+- 提交，含 `git commit`、`git commit --amend`、空提交
+- 新分支、`checkout -b`、`switch -c`
+- 会产生提交的 `merge`、`rebase`、`cherry-pick`
+- 标签
+- `git worktree add`
+- `git stash`
+- `push`、`pull`、`fetch` 以外的远程写操作；`push` 同样要先得到允许
+
+可以读仓库：`status`、`diff`、`log`、`show`。不要为了计划里的 Commit 步骤、收尾流程或「落地」去提交。
+
+```text
+用户：把这个函数改好
+❌ git checkout -b fix-foo && git commit
+✅ 只改工作区里的文件，停在未提交状态
+
+用户：提交这些改动
+✅ 再按用户的提交要求创建提交
+```

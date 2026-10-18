@@ -1,9 +1,9 @@
 import json
+from contextlib import contextmanager
 from datetime import timedelta
 
-from video_agent.config import load_config
 from video_agent.errors import VideoAgentError
-from video_agent.lease import MAX_AUTO_RETRIES, hold_lease
+from video_agent.lease import MAX_AUTO_RETRIES, LeaseLostError, assert_lease, hold_lease, redact_error, owned_transaction
 from video_agent.models import AudioOptions, PlanDocument, ProductInfo, TickResult, VideoOptions
 from video_agent.ports import DEFAULT_VIDEO_CAPABILITIES, PlanRequest
 from video_agent.state import apply_patch, dumps, load_plan_document, publish_document, read_task_row, validate_frame_span
@@ -13,29 +13,31 @@ def recover_expired(agent) -> int:
     now = agent.clock.now().isoformat()
     with agent.db.transaction() as conn:
         cursor = conn.execute(
-            "UPDATE work_items SET lease_owner=NULL, lease_until=NULL WHERE lease_until IS NOT NULL AND lease_until<?",
-            (now,),
+            'UPDATE work_items SET lease_owner=NULL, lease_until=NULL WHERE lease_until IS NOT NULL AND lease_until<=:p0',
+            {'p0': now},
         )
         return int(cursor.rowcount)
 
 
-def tick_once(agent) -> TickResult:
-    config = load_config(agent.home)
+def tick_once(agent, *, runtime_owner=None) -> TickResult:
+    config = agent.settings_service.read_effective_config() if agent.settings_service is not None else agent.config
     now = agent.clock.now()
     now_iso = now.isoformat()
     lease_until = (now + timedelta(seconds=config.lease_seconds)).isoformat()
-    with agent.db.transaction() as conn:
-        work = _claim(conn, owner=agent.worker_owner, now_iso=now_iso, lease_until=lease_until)
+    with _claim_transaction(agent, runtime_owner) as conn:
+        work = _claim(conn, owner=agent.worker_owner, now_iso=now_iso, lease_until=lease_until,
+                      runtime_owner=runtime_owner, clock=agent.clock)
         if work is None:
             return TickResult(did_work=False)
         if work["kind"] == "planning" and work["step"] == "start":
             conn.execute(
-                "UPDATE tasks SET status='planning', stage='planning', stage_detail=NULL, updated_at=? WHERE task_id=?",
-                (now_iso, work["task_id"]),
+                "UPDATE tasks SET status='planning', stage='planning', stage_detail=NULL, updated_at=:p0 WHERE task_id=:p1",
+                {'p0': now_iso, 'p1': work["task_id"]},
             )
+            assert_lease(conn, work['work_id'], agent.worker_owner, agent.clock)
             conn.execute(
-                "UPDATE work_items SET step='finish', lease_owner=NULL, lease_until=NULL WHERE work_id=?",
-                (work["work_id"],),
+                "UPDATE work_items SET step='finish', lease_owner=NULL, lease_until=NULL WHERE work_id=:p0",
+                {'p0': work["work_id"]},
             )
             return TickResult(did_work=True, task_id=work["task_id"], step="start")
         if work["kind"] == "planning" and work["step"] == "finish":
@@ -48,39 +50,77 @@ def tick_once(agent) -> TickResult:
             mode = "generation"
         else:
             raise VideoAgentError("STATE_CONFLICT", "未知的工作步骤", task_id=work["task_id"])
-    if mode == "generation":
-        from video_agent.pipeline import advance_generation
-
-        step = advance_generation(agent, work_id)
-        return TickResult(did_work=True, task_id=task_id, step=step)
-    _finish_planning(agent, work_id)
+    execution = agent._for_work(work)
+    try:
+        if mode == "generation":
+            from video_agent.pipeline import advance_generation
+            step = advance_generation(execution, work_id)
+            return TickResult(did_work=True, task_id=task_id, step=step)
+        _finish_planning(execution, work_id)
+    except LeaseLostError:
+        # A late provider result belongs to an expired owner and cannot change
+        # work, task, plan, shot, generation, artifact or failure state.
+        pass
     return TickResult(did_work=True, task_id=task_id, step="finish")
 
 
-def _claim(conn, *, owner: str, now_iso: str, lease_until: str):
+def _assert_runtime(conn, owner, clock):
+    row = conn.execute(conn.for_update('SELECT * FROM worker_heartbeats WHERE singleton_id=1')).fetchone()
+    if (row is None or row['worker_owner'] != owner or row['stopping'] or not row['lease_until']
+            or row['lease_until'] <= clock.now().isoformat()):
+        raise LeaseLostError()
+    return row
+
+
+@contextmanager
+def _claim_transaction(agent, runtime_owner):
+    with agent.db.transaction() as conn:
+        yield conn
+        # Include task-lock waits and the planning/start transition in this
+        # deadline check, before committing or releasing the singleton lock.
+        if runtime_owner is not None:
+            _assert_runtime(conn, runtime_owner, agent.clock)
+
+
+def _claim(conn, *, owner: str, now_iso: str, lease_until: str, runtime_owner=None, clock=None):
+    runtime = None
+    lease_span = None
+    if runtime_owner is not None:
+        # Lock order is singleton then work. A renewal committed before this
+        # transaction is insufficient: it may have expired while we paused or
+        # waited for a replacement runtime's transaction.
+        runtime = _assert_runtime(conn, runtime_owner, clock)
+        current = clock.now().isoformat()
+        from datetime import datetime
+        lease_span = datetime.fromisoformat(lease_until) - datetime.fromisoformat(now_iso)
+        now_iso = current
     row = conn.execute(
-        """SELECT * FROM work_items
-           WHERE done=0 AND ready_at<=?
-             AND (next_attempt_at IS NULL OR next_attempt_at<=?)
-             AND (lease_until IS NULL OR lease_until<?)
-           ORDER BY ready_at ASC, work_id ASC
-           LIMIT 1""",
-        (now_iso, now_iso, now_iso),
+        conn.for_update('SELECT * FROM work_items\n           WHERE done=0 AND ready_at<=:p0\n             AND (next_attempt_at IS NULL OR next_attempt_at<=:p1)\n             AND (lease_until IS NULL OR lease_until<=:p2)\n           ORDER BY ready_at ASC, work_id ASC\n           LIMIT 1', skip_locked=True),
+        {'p0': now_iso, 'p1': now_iso, 'p2': now_iso},
     ).fetchone()
     if row is None:
         return None
+    if runtime is not None:
+        current = clock.now()
+        if runtime['lease_until'] <= current.isoformat():
+            raise LeaseLostError()
+        lease_until = (current + lease_span).isoformat()
     conn.execute(
-        "UPDATE work_items SET lease_owner=?, lease_until=? WHERE work_id=?",
-        (owner, lease_until, row["work_id"]),
+        'UPDATE work_items SET lease_owner=:p0, lease_until=:p1 WHERE work_id=:p2',
+        {'p0': owner, 'p1': lease_until, 'p2': row["work_id"]},
     )
+    row['lease_owner'] = owner
+    row['lease_until'] = lease_until
+    if runtime is not None and runtime['lease_until'] <= clock.now().isoformat():
+        raise LeaseLostError()
     return row
 
 
 def _finish_planning(agent, work_id: str) -> None:
-    config = load_config(agent.home)
+    config = agent.config
     with hold_lease(agent.db, work_id, agent.worker_owner, agent.clock, config.lease_seconds):
-        with agent.db.transaction() as conn:
-            work = conn.execute("SELECT * FROM work_items WHERE work_id=?", (work_id,)).fetchone()
+        with owned_transaction(agent.db, work_id, agent.worker_owner, agent.clock) as conn:
+            work = conn.execute('SELECT * FROM work_items WHERE work_id=:p0', {'p0': work_id}).fetchone()
             task = read_task_row(conn, work["task_id"])
             current = None
             if task["pending_instruction"]:
@@ -120,10 +160,12 @@ def _plan_request(agent, task, config) -> PlanRequest:
 
 
 def _apply_planning_outcome(agent, work_id: str, outcome) -> None:
-    config = load_config(agent.home)
+    config = agent.config
     now = agent.clock.now().isoformat()
-    with agent.db.transaction() as conn:
-        work = conn.execute("SELECT * FROM work_items WHERE work_id=?", (work_id,)).fetchone()
+    if isinstance(outcome, VideoAgentError):
+        outcome = redact_error(agent, outcome)
+    with owned_transaction(agent.db, work_id, agent.worker_owner, agent.clock) as conn:
+        work = conn.execute('SELECT * FROM work_items WHERE work_id=:p0', {'p0': work_id}).fetchone()
         task = read_task_row(conn, work["task_id"])
         if isinstance(outcome, VideoAgentError):
             if outcome.code == "PROVIDER_TEMPORARY" and _schedule_retry(conn, agent, work, outcome):
@@ -133,14 +175,8 @@ def _apply_planning_outcome(agent, work_id: str, outcome) -> None:
         questions = _nonempty(getattr(outcome, "questions", None))
         if questions is not None:
             conn.execute(
-                """UPDATE tasks SET
-                    status='awaiting_input', stage=NULL, stage_detail=NULL,
-                    failure_scope=NULL, failure_code=NULL, failure_message=NULL,
-                    failure_stage=NULL, failure_retryable=NULL, failure_details_json=NULL,
-                    questions_json=?, pending_instruction=NULL, completed_shots=NULL,
-                    total_shots=NULL, updated_at=?
-                   WHERE task_id=?""",
-                (dumps(questions), now, task["task_id"]),
+                "UPDATE tasks SET\n                    status='awaiting_input', stage=NULL, stage_detail=NULL,\n                    failure_scope=NULL, failure_code=NULL, failure_message=NULL,\n                    failure_stage=NULL, failure_retryable=NULL, failure_details_json=NULL,\n                    questions_json=:p0, pending_instruction=NULL, completed_shots=NULL,\n                    total_shots=NULL, updated_at=:p1\n                   WHERE task_id=:p2",
+                {'p0': dumps(questions), 'p1': now, 'p2': task["task_id"]},
             )
             _finish_work(conn, work_id)
             return
@@ -187,11 +223,8 @@ def _schedule_retry(conn, agent, work, error: VideoAgentError) -> bool:
         delay = 0.0
     nxt = (agent.clock.now() + timedelta(seconds=delay)).isoformat()
     conn.execute(
-        """UPDATE work_items SET
-            copied_config_json=?, next_attempt_at=?, ready_at=?,
-            lease_owner=NULL, lease_until=NULL, done=0, step='finish'
-           WHERE work_id=?""",
-        (dumps(copied), nxt, nxt, work["work_id"]),
+        "UPDATE work_items SET\n            copied_config_json=:p0, next_attempt_at=:p1, ready_at=:p2,\n            lease_owner=NULL, lease_until=NULL, done=0, step='finish'\n           WHERE work_id=:p3",
+        {'p0': dumps(copied), 'p1': nxt, 'p2': nxt, 'p3': work["work_id"]},
     )
     return True
 
@@ -207,7 +240,7 @@ def _validate_planner_document(conn, task, document: PlanDocument, *, require_se
     if document.first_frame_source == "generate" and document.first_frame_asset_id is not None:
         raise VideoAgentError("PROVIDER_REJECTED", "未指定首帧时不能引用首帧素材")
     if document.music_asset_id:
-        row = conn.execute("SELECT kind FROM assets WHERE asset_id=?", (document.music_asset_id,)).fetchone()
+        row = conn.execute('SELECT kind FROM assets WHERE asset_id=:p0', {'p0': document.music_asset_id}).fetchone()
         if row is None or row["kind"] != "audio":
             raise VideoAgentError("PROVIDER_REJECTED", "方案引用了不存在的音频")
 
@@ -215,21 +248,16 @@ def _validate_planner_document(conn, task, document: PlanDocument, *, require_se
 def _fail_planning(conn, task_id: str, work_id: str, error: VideoAgentError, now: str) -> None:
     retryable = 1 if error.code in {"PROVIDER_REJECTED", "PROVIDER_TEMPORARY", "PROVIDER_SUBMISSION_UNCERTAIN"} else 0
     conn.execute(
-        """UPDATE tasks SET
-            status='failed', stage='planning', stage_detail=NULL, failure_scope='planning',
-            failure_code=?, failure_message=?, failure_stage='planning', failure_retryable=?,
-            failure_details_json=?, questions_json='[]', completed_shots=NULL, total_shots=NULL,
-            updated_at=?
-           WHERE task_id=?""",
-        (error.code, error.message, retryable, None if error.details is None else dumps(error.details), now, task_id),
+        "UPDATE tasks SET\n            status='failed', stage='planning', stage_detail=NULL, failure_scope='planning',\n            failure_code=:p0, failure_message=:p1, failure_stage='planning', failure_retryable=:p2,\n            failure_details_json=:p3, questions_json='[]', completed_shots=NULL, total_shots=NULL,\n            updated_at=:p4\n           WHERE task_id=:p5",
+        {'p0': error.code, 'p1': error.message, 'p2': retryable, 'p3': None if error.details is None else dumps(error.details), 'p4': now, 'p5': task_id},
     )
     _finish_work(conn, work_id)
 
 
 def _finish_work(conn, work_id: str) -> None:
     conn.execute(
-        "UPDATE work_items SET done=1, lease_owner=NULL, lease_until=NULL, next_attempt_at=NULL WHERE work_id=?",
-        (work_id,),
+        'UPDATE work_items SET done=1, lease_owner=NULL, lease_until=NULL, next_attempt_at=NULL WHERE work_id=:p0',
+        {'p0': work_id},
     )
 
 

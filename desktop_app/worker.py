@@ -18,10 +18,17 @@ def tick_loop(agent, stop_event: threading.Event, sleep: Callable[[float], None]
 
 
 def start_worker(agent, stop_event: threading.Event, sleep: Callable[[float], None] | None = None) -> threading.Thread:
-    agent.recover()
+    if getattr(agent, "settings_service", None) is not None:
+        from video_agent.worker_main import run_worker
+
+        target, args = run_worker, (agent, stop_event)
+    else:
+        # Explicit legacy/test agents have no database singleton protocol.
+        agent.recover()
+        target, args = tick_loop, (agent, stop_event, sleep)
     thread = threading.Thread(
-        target=tick_loop,
-        args=(agent, stop_event, sleep),
+        target=target,
+        args=args,
         name="video-agent-worker",
         daemon=True,
     )

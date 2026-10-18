@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 from video_agent.errors import VideoAgentError
 
@@ -65,6 +65,9 @@ class AdapterConfig(BaseModel):
 
     adapter: str
 
+    def __repr_args__(self):
+        return [(key, _safe_repr_value(value)) for key, value in super().__repr_args__() if not _is_secret(str(key))]
+
     def field_map(self) -> dict[str, str]:
         extra = self.model_extra or {}
         return {str(key): str(value) for key, value in extra.items()}
@@ -72,13 +75,20 @@ class AdapterConfig(BaseModel):
 
 class AdapterSetting(BaseModel):
     adapter: str
-    fields: dict[str, str] = Field(default_factory=dict)
+    fields: dict[str, str] = Field(default_factory=dict, repr=False)
 
 
 class SettingsPatch(BaseModel):
-    duration_tiers: list[int] | None = None
-    default_duration: int | None = None
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+    duration_tiers: list[StrictInt] | None = None
+    default_duration: StrictInt | None = None
     mode: Literal["fake", "real"] | None = None
+    max_images: StrictInt | None = None
+    max_file_bytes: StrictInt | None = None
+    video_bitrate: StrictInt | None = None
+    audio_bitrate: StrictInt | None = None
+    lease_seconds: StrictInt | None = None
+    resolutions: dict[str, tuple[StrictInt, StrictInt]] | None = None
     planner: AdapterSetting | None = None
     video: AdapterSetting | None = None
     voice: AdapterSetting | None = None
@@ -111,7 +121,7 @@ def _plain_int(value: object, label: str) -> int:
 
 def _is_secret(name: str) -> bool:
     lowered = name.lower()
-    return "key" in lowered or "token" in lowered or "secret" in lowered
+    return any(part in lowered for part in ("key", "token", "secret", "password", "credential", "authorization"))
 
 
 def _validate_data(data: object) -> AppConfig:
@@ -246,34 +256,87 @@ def _load_real_adapters() -> dict:
     return dict(REAL_ADAPTERS)
 
 
-def _assert_real_mode(adapters: dict[str, AdapterConfig]) -> None:
-    registry = _load_real_adapters()
+_ROLE_LABELS = {
+    "planner": "文本大模型",
+    "video": "视频生成",
+    "visual": "视觉大模型",
+    "voice": "配音",
+    "music": "音乐",
+}
+_FIELD_LABELS = {
+    "base_url": "接口根地址",
+    "api_key": "API Key",
+    "model": "模型名",
+    "max_segment_seconds": "单段最长秒数",
+}
+
+
+def wan_segment_error(raw: str) -> str | None:
+    text = raw.strip()
+    if text == "":
+        return "视频生成还没填 单段最长秒数"
+    if not text.isdigit() or not 1 <= int(text) <= 15:
+        return "视频生成的单段最长秒数要填 1 到 15 的整数"
+    return None
+
+
+def _required_names(entry: object) -> list[str]:
+    if isinstance(entry, dict):
+        raw = entry.get("required", [])
+        if isinstance(raw, list):
+            return [str(item) for item in raw]
+        return []
+    raw = getattr(entry, "required_fields", ())
+    return [str(item) for item in raw]
+
+
+def _blank_required(role: str, entry: object, adapter: AdapterConfig) -> list[str]:
+    fields = adapter.field_map()
     missing: list[str] = []
+    for field in _required_names(entry):
+        if fields.get(field, "").strip() == "":
+            label = _FIELD_LABELS.get(field, field)
+            missing.append(f"{_ROLE_LABELS.get(role, role)}还没填 {label}")
+    return missing
+
+
+def _assert_real_mode(adapters: dict[str, AdapterConfig]) -> None:
+    from video_agent.factory import adapter_roles
+    for role, adapter in adapters.items():
+        if adapter.adapter not in {"fake", "none"} and role not in adapter_roles(adapter.adapter):
+            if adapter.adapter in _load_real_adapters():
+                _fail("适配器与模型角色不兼容")
+    registry = _load_real_adapters()
+    missing_roles: list[str] = []
+    missing_fields: list[str] = []
     for role in ("planner", "video"):
         name = adapters[role].adapter
         if name in {"fake", "none"} or name not in registry:
-            missing.append(role)
+            missing_roles.append(role)
             continue
-        entry = registry.get(name)
-        required: list[str] = []
-        if isinstance(entry, dict):
-            raw_required = entry.get("required", [])
-            if isinstance(raw_required, list):
-                required = [str(item) for item in raw_required]
-        fields = adapters[role].field_map()
-        for field in required:
-            if fields.get(field, "") == "":
-                missing.append(f"{role}.{field}")
-    if missing:
+        missing_fields.extend(_blank_required(role, registry[name], adapters[role]))
+    if missing_roles:
         raise VideoAgentError(
             "VALIDATION_ERROR",
             "没有已注册的真实规划或视频适配器",
-            details={"missing": missing},
+            details={"missing": missing_roles},
         )
     for role in ("voice", "music", "visual"):
         name = adapters[role].adapter
-        if name not in {"fake", "none"} and name not in registry:
-            raise VideoAgentError("VALIDATION_ERROR", f"{role} 适配器未注册")
+        if name in {"fake", "none"}:
+            continue
+        if name not in registry:
+            raise VideoAgentError("VALIDATION_ERROR", f"{_ROLE_LABELS.get(role, role)}还没有对应接口")
+        missing_fields.extend(_blank_required(role, registry[name], adapters[role]))
+    video_adapter = adapters["video"]
+    if video_adapter.adapter == "wan":
+        raw_segment = video_adapter.field_map().get("max_segment_seconds", "")
+        if raw_segment.strip() != "":
+            segment_error = wan_segment_error(raw_segment)
+            if segment_error:
+                missing_fields.append(segment_error)
+    if missing_fields:
+        raise VideoAgentError("VALIDATION_ERROR", "；".join(missing_fields), fields=missing_fields)
 
 
 def _merge_adapter(current: AdapterConfig, patch: AdapterSetting) -> AdapterConfig:
@@ -292,12 +355,10 @@ def save_settings(home: Path, patch: SettingsPatch) -> AppConfig:
     current = load_config(home)
     before = path.read_bytes()
     data = config_to_dict(current)
-    if patch.duration_tiers is not None:
-        data["duration_tiers"] = list(patch.duration_tiers)
-    if patch.default_duration is not None:
-        data["default_duration"] = patch.default_duration
-    if patch.mode is not None:
-        data["mode"] = patch.mode
+    for field in PUBLIC_SETTING_FIELDS:
+        value = getattr(patch, field)
+        if value is not None:
+            data[field] = value
     adapters = {role: current.adapters[role] for role in ADAPTER_ROLES}
     for role in ADAPTER_ROLES:
         role_patch = getattr(patch, role)
@@ -314,3 +375,36 @@ def save_settings(home: Path, patch: SettingsPatch) -> AppConfig:
         raise
     path.write_text(_dump(updated), encoding="utf-8")
     return updated
+
+
+PUBLIC_SETTING_FIELDS = (
+    "mode", "duration_tiers", "default_duration", "max_images", "max_file_bytes",
+    "video_bitrate", "audio_bitrate", "lease_seconds", "resolutions",
+)
+
+
+def validate_config(data: object, *, require_usable: bool = True) -> AppConfig:
+    """Shared validation for legacy imports and transactional configuration updates."""
+    result = _validate_data(data)
+    if require_usable and result.mode == "real":
+        _assert_real_mode(result.adapters)
+    return result
+
+
+def read_legacy_config(path: Path) -> AppConfig:
+    """Read only the explicitly selected legacy file; never create or search files."""
+    try:
+        return validate_config(json.loads(path.read_text(encoding="utf-8")))
+    except VideoAgentError:
+        raise
+    except (OSError, UnicodeError, ValueError, TypeError):
+        raise VideoAgentError("VALIDATION_ERROR", "配置无法读取或不符合规则") from None
+
+
+def _safe_repr_value(value):
+    if isinstance(value, dict):
+        return {key: "<redacted>" if _is_secret(str(key)) else _safe_repr_value(child)
+                for key, child in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_safe_repr_value(child) for child in value]
+    return value

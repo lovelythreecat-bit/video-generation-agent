@@ -6,10 +6,11 @@ import shutil
 import uuid
 from contextlib import contextmanager
 from datetime import timedelta
+from functools import wraps
 from pathlib import Path
 
 from video_agent.errors import VideoAgentError
-from video_agent.lease import MAX_AUTO_RETRIES, hold_lease
+from video_agent.lease import MAX_AUTO_RETRIES, LeaseLostError, assert_lease, hold_lease, redact_error, owned_transaction
 import video_agent.media as media
 from video_agent.media import (
     _atempo_pad,
@@ -48,13 +49,68 @@ _DETAIL = {
 }
 
 
+def _private_stage(function):
+    """Never reuse an interrupted attempt's output or share a writer's paths."""
+    @wraps(function)
+    def run(agent, work, *args, **kwargs):
+        root = _scratch_dir(agent, work) / uuid.uuid4().hex[:8]
+        root.mkdir()
+        try:
+            return function(agent, work, *args, private=root, **kwargs)
+        finally:
+            shutil.rmtree(root)
+    return run
+
+
+@contextmanager
+def _publication_transaction(agent, publication):
+    """Publish a completed file set with its SQL transition under the work lock.
+
+    Only short same-volume renames run here. Restore replaced files on a body
+    error or deadline expiry while the work row is still locked. A process crash
+    can leave a partial set; the unchanged step rebuilds it from a fresh attempt
+    directory instead of treating file existence as proof of stage completion.
+    """
+    with agent.db.transaction() as conn:
+        work_id = getattr(agent, '_active_work_id', None)
+        locked = assert_lease(conn, work_id, agent.worker_owner, agent.clock) if work_id else None
+        moved = []
+        try:
+            for index, (source, dest) in enumerate(publication.items()):
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                backup = source.parent / f'.previous-{index}'
+                present = dest.is_file()
+                if present:
+                    os.replace(dest, backup)
+                moved.append((source, dest, backup, present, False))
+                os.replace(source, dest)
+                moved[-1] = (source, dest, backup, present, True)
+            yield conn
+            if locked and locked['lease_until'] <= agent.clock.now().isoformat():
+                raise LeaseLostError()
+        except BaseException:
+            # Do this before the SQL context rolls back and releases its lock.
+            for source, dest, backup, present, published in reversed(moved):
+                if published:
+                    os.replace(dest, source)
+                if present:
+                    os.replace(backup, dest)
+            raise
+
+
 def advance_generation(agent, work_id: str) -> str:
     work = _load_work(agent, work_id)
     _sync_config_without_external_id(agent, work)
     work = _load_work(agent, work_id)
     step = str(work["step"])
     try:
-        _dispatch(agent, work, step)
+        if step in {'first_frame', 'audio', 'compose', 'visual', 'export'}:
+            with hold_lease(agent.db, work_id, agent.worker_owner, agent.clock, int(agent.config.lease_seconds)):
+                _dispatch(agent, work, step)
+        else:
+            _dispatch(agent, work, step)
+    except LeaseLostError:
+        raise
     except VideoAgentError as exc:
         _handle_generation_error(agent, work, exc)
     except Exception as exc:
@@ -69,20 +125,19 @@ def advance_generation(agent, work_id: str) -> str:
 def _sync_config_without_external_id(agent, work: dict) -> None:
     with _transaction(agent) as conn:
         external = conn.execute(
-            """SELECT 1 FROM generation_shots
-               WHERE generation_id=? AND external_task_id IS NOT NULL LIMIT 1""",
-            (work["generation_id"],),
+            "SELECT 1 FROM generation_shots\n               WHERE generation_id=:p0 AND (external_task_id IS NOT NULL OR submission_state IN ('intended', 'uncertain')) LIMIT 1",
+            {'p0': work["generation_id"]},
         ).fetchone()
         if external is not None:
             return
         conn.execute(
-            "UPDATE generations SET copied_config_json=? WHERE generation_id=?",
-            (work["copied_config_json"], work["generation_id"]),
+            'UPDATE generations SET copied_config_json=:p0 WHERE generation_id=:p1',
+            {'p0': work["copied_config_json"], 'p1': work["generation_id"]},
         )
 
 
 def _provider_config(agent, work: dict, shot: dict) -> dict:
-    if shot.get("external_task_id"):
+    if shot.get("external_task_id") or shot.get('submission_state') in {'intended', 'uncertain'}:
         generation = _require_generation(agent, work["generation_id"])
         return json.loads(generation["copied_config_json"])
     return json.loads(work["copied_config_json"])
@@ -99,20 +154,21 @@ def _remember_provider_config(agent, purpose: str, config: dict) -> None:
 def _set_stage_detail(agent, generation_id: str, detail: str) -> None:
     with _transaction(agent) as conn:
         conn.execute(
-            "UPDATE generations SET stage_detail=? WHERE generation_id=?",
-            (detail, generation_id),
+            'UPDATE generations SET stage_detail=:p0 WHERE generation_id=:p1',
+            {'p0': detail, 'p1': generation_id},
         )
 
 
 def _clear_lease(agent, work: dict) -> None:
     with _transaction(agent) as conn:
         conn.execute(
-            "UPDATE work_items SET lease_owner=NULL, lease_until=NULL, done=0 WHERE work_id=?",
-            (work["work_id"],),
+            'UPDATE work_items SET lease_owner=NULL, lease_until=NULL, done=0 WHERE work_id=:p0',
+            {'p0': work["work_id"]},
         )
 
 
 def _handle_generation_error(agent, work: dict, exc: VideoAgentError) -> None:
+    exc = redact_error(agent, exc)
     if exc.code in {"PROVIDER_TEMPORARY", "SHOT_DURATION_SHORT"} and _schedule_generation_retry(agent, work, exc):
         return
     _fail(agent, work, exc)
@@ -137,22 +193,16 @@ def _schedule_generation_retry(agent, work: dict, exc: VideoAgentError) -> bool:
     stage = exc.stage or _STAGE.get(str(work["step"]))
     with _transaction(agent) as conn:
         conn.execute(
-            """UPDATE generations
-               SET status='running', stage=?, auto_attempts_used=?, next_attempt_at=?, updated_at=?
-               WHERE generation_id=?""",
-            (stage, used + 1, later, now, work["generation_id"]),
+            "UPDATE generations\n               SET status='running', stage=:p0, auto_attempts_used=:p1, next_attempt_at=:p2, updated_at=:p3\n               WHERE generation_id=:p4",
+            {'p0': stage, 'p1': used + 1, 'p2': later, 'p3': now, 'p4': work["generation_id"]},
         )
         conn.execute(
-            """UPDATE tasks
-               SET status='generating', stage=?, updated_at=?
-               WHERE task_id=?""",
-            (stage, now, work["task_id"]),
+            "UPDATE tasks\n               SET status='generating', stage=:p0, updated_at=:p1\n               WHERE task_id=:p2",
+            {'p0': stage, 'p1': now, 'p2': work["task_id"]},
         )
         conn.execute(
-            """UPDATE work_items
-               SET done=0, lease_owner=NULL, lease_until=NULL, next_attempt_at=?
-               WHERE work_id=?""",
-            (later, work["work_id"]),
+            'UPDATE work_items\n               SET done=0, lease_owner=NULL, lease_until=NULL, next_attempt_at=:p0\n               WHERE work_id=:p1',
+            {'p0': later, 'p1': work["work_id"]},
         )
     return True
 
@@ -187,7 +237,8 @@ def _dispatch(agent, work: dict, step: str) -> None:
     )
 
 
-def _step_first_frame(agent, work: dict) -> None:
+@_private_stage
+def _step_first_frame(agent, work: dict, *, private: Path) -> None:
     generation = _require_generation(agent, work["generation_id"])
     document = PlanDocument.model_validate_json(generation["snapshot_json"])
     _ensure_shots(agent, work["generation_id"], document)
@@ -202,33 +253,28 @@ def _step_first_frame(agent, work: dict) -> None:
             retryable=False,
         )
     source = _asset_path(agent, document.first_frame_asset_id, "preparing_first_frame")
-    root = _gen_dir(agent, work)
-    root.mkdir(parents=True, exist_ok=True)
+    root = private
     copied = root / f"first_frame{source.suffix.lower() or '.png'}"
-    if not copied.is_file():
-        shutil.copyfile(source, copied)
+    shutil.copyfile(source, copied)
     width, height = _canvas(agent, document.aspect_ratio)
     fitted = root / "first_frame_fitted.png"
-    if not fitted.is_file():
-        fit_image(copied, document.fit, width, height, fitted)
-    _advance(agent, work, "submit_shot")
+    fit_image(copied, document.fit, width, height, fitted)
+    shared = _gen_dir(agent, work)
+    _advance(agent, work, "submit_shot", publication={copied: shared / copied.name, fitted: shared / fitted.name})
 
 
 def _ensure_shots(agent, generation_id: str, document: PlanDocument) -> None:
     with _transaction(agent) as conn:
         count = conn.execute(
-            "SELECT COUNT(*) FROM generation_shots WHERE generation_id=?",
-            (generation_id,),
-        ).fetchone()[0]
+            'SELECT COUNT(*) AS count FROM generation_shots WHERE generation_id=:p0',
+            {'p0': generation_id},
+        ).fetchone()['count']
         if count:
             return
         for ordinal, shot in enumerate(document.shots):
             conn.execute(
-                """INSERT INTO generation_shots (
-                    generation_id, shot_id, ordinal, start_frame, end_frame, status,
-                    provider_idempotency_key, external_task_id, submission_state, clip_path
-                ) VALUES (?, ?, ?, ?, ?, 'pending', NULL, NULL, NULL, NULL)""",
-                (generation_id, shot.shot_id, ordinal, shot.start_frame, shot.end_frame),
+                "INSERT INTO generation_shots (\n                    generation_id, shot_id, ordinal, start_frame, end_frame, status,\n                    provider_idempotency_key, external_task_id, submission_state, clip_path\n                ) VALUES (:p0, :p1, :p2, :p3, :p4, 'pending', NULL, NULL, NULL, NULL)",
+                {'p0': generation_id, 'p1': shot.shot_id, 'p2': ordinal, 'p3': shot.start_frame, 'p4': shot.end_frame},
             )
 
 
@@ -236,35 +282,34 @@ def _enter(agent, work: dict, step: str) -> None:
     now = agent.clock.now().isoformat()
     with _transaction(agent) as conn:
         total = conn.execute(
-            "SELECT COUNT(*) FROM generation_shots WHERE generation_id=? AND status!='reused'",
-            (work["generation_id"],),
-        ).fetchone()[0]
+            "SELECT COUNT(*) AS count FROM generation_shots WHERE generation_id=:p0 AND status!='reused'",
+            {'p0': work["generation_id"]},
+        ).fetchone()['count']
         done = conn.execute(
-            "SELECT COUNT(*) FROM generation_shots WHERE generation_id=? AND status='imported'",
-            (work["generation_id"],),
-        ).fetchone()[0]
+            "SELECT COUNT(*) AS count FROM generation_shots WHERE generation_id=:p0 AND status='imported'",
+            {'p0': work["generation_id"]},
+        ).fetchone()['count']
         conn.execute(
-            """UPDATE generations
-               SET status='running', stage=?, stage_detail=?, completed_shots=?, total_shots=?, updated_at=?
-               WHERE generation_id=?""",
-            (_STAGE[step], _DETAIL[step], done, total, now, work["generation_id"]),
+            "UPDATE generations\n               SET status='running', stage=:p0, stage_detail=:p1, completed_shots=:p2, total_shots=:p3, updated_at=:p4\n               WHERE generation_id=:p5",
+            {'p0': _STAGE[step], 'p1': _DETAIL[step], 'p2': done, 'p3': total, 'p4': now, 'p5': work["generation_id"]},
         )
         conn.execute(
-            """UPDATE tasks
-               SET status='generating', stage=?, stage_detail=?, completed_shots=?, total_shots=?, updated_at=?
-               WHERE task_id=?""",
-            (_STAGE[step], _DETAIL[step], done, total, now, work["task_id"]),
+            "UPDATE tasks\n               SET status='generating', stage=:p0, stage_detail=:p1, completed_shots=:p2, total_shots=:p3, updated_at=:p4\n               WHERE task_id=:p5",
+            {'p0': _STAGE[step], 'p1': _DETAIL[step], 'p2': done, 'p3': total, 'p4': now, 'p5': work["task_id"]},
         )
 
 
-def _advance(agent, work: dict, step: str) -> None:
-    with _transaction(agent) as conn:
-        conn.execute(
-            """UPDATE work_items
-               SET step=?, lease_owner=NULL, lease_until=NULL, next_attempt_at=NULL
-               WHERE work_id=?""",
-            (step, work["work_id"]),
-        )
+def _advance(agent, work: dict, step: str, *, publication=None) -> None:
+    transaction = _publication_transaction(agent, publication) if publication else _transaction(agent)
+    with transaction as conn:
+        _set_work_step(conn, work, step)
+
+
+def _set_work_step(conn, work: dict, step: str) -> None:
+    conn.execute(
+        'UPDATE work_items\n               SET step=:p0, lease_owner=NULL, lease_until=NULL, next_attempt_at=NULL\n               WHERE work_id=:p1',
+        {'p0': step, 'p1': work["work_id"]},
+    )
 
 
 def _fail(agent, work: dict, exc: VideoAgentError) -> None:
@@ -277,36 +322,27 @@ def _fail(agent, work: dict, exc: VideoAgentError) -> None:
     retryable = 1 if exc.retryable else 0
     with _transaction(agent) as conn:
         conn.execute(
-            """UPDATE generations
-               SET status='failed', stage=?, stage_detail=?, failure_code=?, failure_message=?,
-                   failure_stage=?, failure_retryable=?, failure_details_json=?, updated_at=?
-               WHERE generation_id=?""",
-            (stage, exc.message, exc.code, exc.message, stage, retryable, details, now, work["generation_id"]),
+            "UPDATE generations\n               SET status='failed', stage=:p0, stage_detail=:p1, failure_code=:p2, failure_message=:p3,\n                   failure_stage=:p4, failure_retryable=:p5, failure_details_json=:p6, updated_at=:p7\n               WHERE generation_id=:p8",
+            {'p0': stage, 'p1': exc.message, 'p2': exc.code, 'p3': exc.message, 'p4': stage, 'p5': retryable, 'p6': details, 'p7': now, 'p8': work["generation_id"]},
         )
         conn.execute(
-            """UPDATE tasks
-               SET status='failed', stage=?, stage_detail=?, failure_scope='generation',
-                   failure_code=?, failure_message=?, failure_stage=?, failure_retryable=?,
-                   failure_details_json=?, completed_shots=NULL, total_shots=NULL, updated_at=?
-               WHERE task_id=?""",
-            (stage, exc.message, exc.code, exc.message, stage, retryable, details, now, work["task_id"]),
+            "UPDATE tasks\n               SET status='failed', stage=:p0, stage_detail=:p1, failure_scope='generation',\n                   failure_code=:p2, failure_message=:p3, failure_stage=:p4, failure_retryable=:p5,\n                   failure_details_json=:p6, completed_shots=NULL, total_shots=NULL, updated_at=:p7\n               WHERE task_id=:p8",
+            {'p0': stage, 'p1': exc.message, 'p2': exc.code, 'p3': exc.message, 'p4': stage, 'p5': retryable, 'p6': details, 'p7': now, 'p8': work["task_id"]},
         )
         for shot_id in exc.shot_ids or []:
             conn.execute(
-                "UPDATE generation_shots SET status='failed' WHERE generation_id=? AND shot_id=?",
-                (work["generation_id"], shot_id),
+                "UPDATE generation_shots SET status='failed' WHERE generation_id=:p0 AND shot_id=:p1",
+                {'p0': work["generation_id"], 'p1': shot_id},
             )
         conn.execute(
-            """UPDATE work_items
-               SET done=1, lease_owner=NULL, lease_until=NULL, next_attempt_at=NULL
-               WHERE work_id=?""",
-            (work["work_id"],),
+            'UPDATE work_items\n               SET done=1, lease_owner=NULL, lease_until=NULL, next_attempt_at=NULL\n               WHERE work_id=:p0',
+            {'p0': work["work_id"]},
         )
 
 
 def _load_work(agent, work_id: str) -> dict:
     with _transaction(agent) as conn:
-        row = _one(conn, "SELECT * FROM work_items WHERE work_id=?", (work_id,))
+        row = _one(conn, 'SELECT * FROM work_items WHERE work_id=:p0', {'p0': work_id})
     if row is None:
         raise VideoAgentError("NOT_FOUND", "找不到生成工作")
     return row
@@ -314,7 +350,7 @@ def _load_work(agent, work_id: str) -> dict:
 
 def _require_generation(agent, generation_id: str) -> dict:
     with _transaction(agent) as conn:
-        row = _one(conn, "SELECT * FROM generations WHERE generation_id=?", (generation_id,))
+        row = _one(conn, 'SELECT * FROM generations WHERE generation_id=:p0', {'p0': generation_id})
     if row is None:
         raise VideoAgentError("NOT_FOUND", "找不到视频执行")
     return row
@@ -322,7 +358,7 @@ def _require_generation(agent, generation_id: str) -> dict:
 
 def _asset_path(agent, asset_id: str, stage: str) -> Path:
     with _transaction(agent) as conn:
-        row = _one(conn, "SELECT relative_path FROM assets WHERE asset_id=?", (asset_id,))
+        row = _one(conn, 'SELECT relative_path FROM assets WHERE asset_id=:p0', {'p0': asset_id})
     if row is None:
         raise VideoAgentError("ASSET_MISSING", "素材不存在", stage=stage, retryable=True)
     path = agent.files.path_for(row["relative_path"])
@@ -340,18 +376,31 @@ def _gen_dir(agent, work: dict) -> Path:
     return agent.files.home / "tasks" / work["task_id"] / "generations" / work["generation_id"]
 
 
-def _one(conn, sql: str, params: tuple = ()) -> dict | None:
+def _scratch_dir(agent, work):
+    # Keep the publication source private to this work/owner, and short enough
+    # for Windows audio writers that still use MAX_PATH-limited file APIs.
+    path = agent.files.home / 'scratch' / agent.worker_owner[:16] / work['work_id'][:16]
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _one(conn, sql: str, params=None) -> dict | None:
     cursor = conn.execute(sql, params)
     row = cursor.fetchone()
     if row is None:
         return None
-    return {column[0]: row[index] for index, column in enumerate(cursor.description)}
+    return dict(row)
 
 
 @contextmanager
 def _transaction(agent):
-    with agent.db.transaction() as connection:
-        yield connection
+    work_id = getattr(agent, '_active_work_id', None)
+    if work_id is None:
+        with agent.db.transaction() as connection:
+            yield connection
+    else:
+        with owned_transaction(agent.db, work_id, agent.worker_owner, agent.clock) as connection:
+            yield connection
 
 
 _ALLOWED = {
@@ -436,6 +485,9 @@ def _query_before_submit(agent, work: dict, shot: dict) -> str:
 def _submit_new_shot(agent, work: dict, shot: dict) -> None:
     generation = _require_generation(agent, work["generation_id"])
     document = PlanDocument.model_validate_json(generation["snapshot_json"])
+    # An asynchronous/local adapter may consume request images again during
+    # download or after restart. Neighbor images stay in their immutable private
+    # directory for that lifetime rather than being deleted after submission.
     request = _shot_request(agent, work, shot, document)
     _mark_intended(agent, work["generation_id"], shot["shot_id"], request.provider_idempotency_key)
     config = _provider_config(agent, work, shot)
@@ -448,6 +500,8 @@ def _submit_new_shot(agent, work: dict, shot: dict) -> None:
                 _mark_submission(agent, work["generation_id"], shot["shot_id"], "uncertain", None, "pending")
                 _clear_lease(agent, work)
                 return
+            if exc.code == 'PROVIDER_REJECTED':
+                _mark_submission(agent, work['generation_id'], shot['shot_id'], 'absent', None, 'pending')
             raise
         except Exception as exc:
             raise VideoAgentError(
@@ -467,21 +521,32 @@ def _submit_new_shot(agent, work: dict, shot: dict) -> None:
 
 def _step_import_shot(agent, work: dict) -> None:
     generation = _require_generation(agent, work["generation_id"])
-    download_only = generation["stage_detail"] == "download"
     _enter(agent, work, "import_shot")
     shot = _next_shot(agent, work["generation_id"])
     if shot is None:
         _advance(agent, work, "audio")
         return
-    if not download_only:
-        if not shot["provider_idempotency_key"] and not shot["external_task_id"]:
-            raise VideoAgentError(
-                "PROVIDER_SUBMISSION_UNCERTAIN",
-                "无法确认外部任务是否已经创建",
-                stage="generating_shots",
-                retryable=True,
-                shot_ids=[shot["shot_id"]],
-            )
+    if not shot["provider_idempotency_key"] and not shot["external_task_id"]:
+        # Older workers committed the prior shot before advancing the work
+        # step. Only that durable predecessor permits returning a pristine next
+        # shot to submission. Missing evidence on the first shot stays uncertain.
+        with _transaction(agent) as conn:
+            predecessor = conn.execute(
+                "SELECT 1 AS completed FROM generation_shots WHERE generation_id=:id AND ordinal<:ordinal "
+                "AND status IN ('imported', 'reused') AND clip_path IS NOT NULL AND clip_path<>'' LIMIT 1",
+                {'id': work['generation_id'], 'ordinal': shot['ordinal']},
+            ).fetchone()
+        if shot['status'] == 'pending' and shot['submission_state'] is None and predecessor is not None:
+            _advance(agent, work, 'submit_shot')
+            return
+        raise VideoAgentError(
+            "PROVIDER_SUBMISSION_UNCERTAIN",
+            "无法确认外部任务是否已经创建",
+            stage="generating_shots",
+            retryable=True,
+            shot_ids=[shot["shot_id"]],
+        )
+    if generation["stage_detail"] != "download":
         config = _provider_config(agent, work, shot)
         _remember_provider_config(agent, "query", config)
         with hold_lease(agent.db, work["work_id"], agent.worker_owner, agent.clock, int(agent.config.lease_seconds)):
@@ -526,7 +591,7 @@ def _step_import_shot(agent, work: dict) -> None:
             details={"retry_after_seconds": 1},
         ) from exc
     root = _gen_dir(agent, work)
-    dest = root / "shots" / f"{shot['shot_id']}.mp4"
+    dest = _scratch_dir(agent, work) / f"{shot['shot_id']}.mp4"
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(data)
     needed = int(shot["end_frame"]) - int(shot["start_frame"])
@@ -543,7 +608,14 @@ def _step_import_shot(agent, work: dict) -> None:
         )
     if info.frame_count > needed:
         trimmed = dest.with_suffix(".trim.mp4")
-        _trim_clip(dest, needed, trimmed, int(agent.config.video_bitrate))
+        _trim_clip(
+            dest,
+            needed,
+            trimmed,
+            int(agent.config.video_bitrate),
+            keep_audio=info.has_audio and bool(document.voiceover or document.music),
+            audio_bitrate=int(agent.config.audio_bitrate),
+        )
         os.replace(trimmed, dest)
         info = probe(dest)
         if info.frame_count != needed:
@@ -554,31 +626,27 @@ def _step_import_shot(agent, work: dict) -> None:
                 retryable=True,
                 shot_ids=[shot["shot_id"]],
             )
-    relative = dest.relative_to(agent.files.home).as_posix()
-    _mark_imported(agent, work["generation_id"], shot["shot_id"], relative)
-    if _next_shot(agent, work["generation_id"]) is None:
-        _advance(agent, work, "audio")
-    else:
-        _advance(agent, work, "submit_shot")
+    published = root / 'shots' / f"{shot['shot_id']}.mp4"
+    published.parent.mkdir(parents=True, exist_ok=True)
+    relative = published.relative_to(agent.files.home).as_posix()
+    _mark_imported(agent, work["generation_id"], shot["shot_id"], relative, source=dest, work=work)
 
 
 def _defer(agent, work: dict) -> None:
     later = (agent.clock.now() + timedelta(seconds=1)).isoformat()
     with _transaction(agent) as conn:
         conn.execute(
-            """UPDATE work_items
-               SET next_attempt_at=?, lease_owner=NULL, lease_until=NULL, done=0
-               WHERE work_id=?""",
-            (later, work["work_id"]),
+            'UPDATE work_items\n               SET next_attempt_at=:p0, lease_owner=NULL, lease_until=NULL, done=0\n               WHERE work_id=:p1',
+            {'p0': later, 'p1': work["work_id"]},
         )
 
 
-def _shot_request(agent, work: dict, shot: dict, document: PlanDocument) -> ShotRequest:
+def _shot_request(agent, work: dict, shot: dict, document: PlanDocument, *, private=None) -> ShotRequest:
     plan_shot = _plan_shot(document, shot["shot_id"])
     width, height = _canvas(agent, document.aspect_ratio)
     references = [_asset_path(agent, asset_id, "generating_shots") for asset_id in _image_ids(agent, work["task_id"])]
     generation = _require_generation(agent, work["generation_id"])
-    first_path, tail_path, extras = _neighbor_media(agent, work, generation, document, shot)
+    first_path, tail_path, extras = _neighbor_media(agent, work, generation, document, shot, private=private)
     references.extend(extras)
     key = shot["provider_idempotency_key"] or f"{work['generation_id']}:{shot['shot_id']}"
     return ShotRequest(
@@ -595,6 +663,7 @@ def _shot_request(agent, work: dict, shot: dict, document: PlanDocument) -> Shot
         width=width,
         height=height,
         provider_idempotency_key=key,
+        with_audio=bool(document.voiceover or document.music),
     )
 
 
@@ -602,44 +671,52 @@ def _next_shot(agent, generation_id: str) -> dict | None:
     with _transaction(agent) as conn:
         return _one(
             conn,
-            """SELECT * FROM generation_shots
-               WHERE generation_id=? AND status NOT IN ('imported', 'reused')
-               ORDER BY ordinal LIMIT 1""",
-            (generation_id,),
+            "SELECT * FROM generation_shots\n               WHERE generation_id=:p0 AND status NOT IN ('imported', 'reused')\n               ORDER BY ordinal LIMIT 1",
+            {'p0': generation_id},
         )
 
 
 def _mark_intended(agent, generation_id: str, shot_id: str, key: str) -> None:
     with _transaction(agent) as conn:
         conn.execute(
-            """UPDATE generation_shots
-               SET provider_idempotency_key=?, submission_state='intended'
-               WHERE generation_id=? AND shot_id=?""",
-            (key, generation_id, shot_id),
+            "UPDATE generation_shots\n               SET provider_idempotency_key=:p0, submission_state='intended'\n               WHERE generation_id=:p1 AND shot_id=:p2",
+            {'p0': key, 'p1': generation_id, 'p2': shot_id},
         )
 
 
 def _mark_submission(agent, generation_id: str, shot_id: str, state: str, external_task_id: str | None, status: str) -> None:
     with _transaction(agent) as conn:
         conn.execute(
-            """UPDATE generation_shots
-               SET submission_state=?, external_task_id=?, status=?
-               WHERE generation_id=? AND shot_id=?""",
-            (state, external_task_id, status, generation_id, shot_id),
+            'UPDATE generation_shots\n               SET submission_state=:p0, external_task_id=:p1, status=:p2\n               WHERE generation_id=:p3 AND shot_id=:p4',
+            {'p0': state, 'p1': external_task_id, 'p2': status, 'p3': generation_id, 'p4': shot_id},
         )
 
 
-def _mark_imported(agent, generation_id: str, shot_id: str, relative: str) -> None:
-    with _transaction(agent) as conn:
+def _mark_imported(agent, generation_id: str, shot_id: str, relative: str, *, source=None, work=None) -> None:
+    publication = {source: agent.files.path_for(relative)} if source is not None else None
+    transaction = _publication_transaction(agent, publication) if publication else _transaction(agent)
+    with transaction as conn:
         conn.execute(
-            """UPDATE generation_shots
-               SET status='imported', clip_path=?
-               WHERE generation_id=? AND shot_id=?""",
-            (relative, generation_id, shot_id),
+            "UPDATE generation_shots\n               SET status='imported', clip_path=:p0\n               WHERE generation_id=:p1 AND shot_id=:p2",
+            {'p0': relative, 'p1': generation_id, 'p2': shot_id},
         )
+        if work is not None:
+            remaining = conn.execute(
+                "SELECT 1 AS remaining FROM generation_shots WHERE generation_id=:id "
+                "AND status NOT IN ('imported', 'reused') LIMIT 1", {'id': generation_id},
+            ).fetchone()
+            _set_work_step(conn, work, 'audio' if remaining is None else 'submit_shot')
 
 
-def _trim_clip(src: Path, frames: int, dest: Path, video_bitrate: int) -> None:
+def _trim_clip(
+    src: Path,
+    frames: int,
+    dest: Path,
+    video_bitrate: int,
+    *,
+    keep_audio: bool = False,
+    audio_bitrate: int = 192000,
+) -> None:
     _run_ffmpeg(
         [
             "-i",
@@ -656,7 +733,7 @@ def _trim_clip(src: Path, frames: int, dest: Path, video_bitrate: int) -> None:
             "ultrafast",
             "-b:v",
             str(video_bitrate),
-            "-an",
+            *(["-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", str(audio_bitrate)] if keep_audio else ["-an"]),
             str(dest),
         ]
     )
@@ -664,7 +741,7 @@ def _trim_clip(src: Path, frames: int, dest: Path, video_bitrate: int) -> None:
 
 def _image_ids(agent, task_id: str) -> list[str]:
     with _transaction(agent) as conn:
-        row = _one(conn, "SELECT image_asset_ids_json FROM tasks WHERE task_id=?", (task_id,))
+        row = _one(conn, 'SELECT image_asset_ids_json FROM tasks WHERE task_id=:p0', {'p0': task_id})
     if row is None:
         raise VideoAgentError("NOT_FOUND", "找不到任务")
     return list(json.loads(row["image_asset_ids_json"]))
@@ -694,19 +771,24 @@ def _prompt(document: PlanDocument, shot: ShotPlan) -> str:
     )
 
 
-def _step_audio(agent, work: dict) -> None:
+@_private_stage
+def _step_audio(agent, work: dict, *, private: Path) -> None:
     _enter(agent, work, "audio")
     generation = _require_generation(agent, work["generation_id"])
     document = PlanDocument.model_validate_json(generation["snapshot_json"])
-    root = _gen_dir(agent, work)
+    root = private
+    shared = _gen_dir(agent, work)
     if not rebuilds_audio(str(generation["kind"])):
         _copy_base_audio(agent, generation, root, document)
-        _advance(agent, work, "compose")
+        _advance(agent, work, "compose", publication={path: shared / path.name for path in root.iterdir() if path.is_file()})
         return
     if not document.voiceover and not document.music:
         _advance(agent, work, "compose")
         return
-    if document.voiceover and agent.voice is None and not (root / "voice.m4a").is_file():
+    if _model_soundtrack(_generation_clips(agent, work)):
+        _advance(agent, work, "compose")
+        return
+    if document.voiceover and agent.voice is None:
         raise VideoAgentError(
             "PROVIDER_REJECTED",
             "配音已开启，但没有可用的配音实现",
@@ -714,11 +796,12 @@ def _step_audio(agent, work: dict) -> None:
             retryable=True,
         )
     bitrate = int(agent.config.audio_bitrate)
-    if document.voiceover and not (root / "voice.m4a").is_file():
+    if document.voiceover:
         _build_voice(agent, work, document, root, bitrate)
-    if document.music and not (root / "music.m4a").is_file():
+    if document.music:
         _build_music(agent, work, document, root, bitrate)
-    _advance(agent, work, "compose")
+    _advance(agent, work, "compose", publication={root / name: shared / name
+             for name in ('voice.m4a', 'music.m4a', 'cues.json') if (root / name).is_file()})
 
 
 def _build_voice(agent, work: dict, document: PlanDocument, root: Path, audio_bitrate: int) -> None:
@@ -788,40 +871,53 @@ def _build_music(agent, work: dict, document: PlanDocument, root: Path, audio_bi
     trim_or_loop_audio(raw, float(document.duration_seconds), dest, audio_bitrate=audio_bitrate)
 
 
-def _step_compose(agent, work: dict) -> None:
+@_private_stage
+def _step_compose(agent, work: dict, *, private: Path) -> None:
     _enter(agent, work, "compose")
     generation = _require_generation(agent, work["generation_id"])
     document = PlanDocument.model_validate_json(generation["snapshot_json"])
-    clips: list[Path] = []
-    with _transaction(agent) as conn:
-        rows = conn.execute(
-            """SELECT shot_id, status, clip_path FROM generation_shots
-               WHERE generation_id=? ORDER BY ordinal""",
-            (work["generation_id"],),
-        ).fetchall()
-    for shot_id, status, clip_path in rows:
-        if status not in {"imported", "reused"} or not clip_path:
-            raise VideoAgentError("MEDIA_EXPORT_FAILED", "镜头片段尚未导入", stage="composing", retryable=True, shot_ids=[shot_id])
-        clips.append(agent.files.path_for(clip_path))
-    dest = _gen_dir(agent, work) / "composed.mp4"
-    media.concat_clips(clips, dest)
+    clips = _generation_clips(agent, work)
+    keep_audio = bool(document.voiceover or document.music) and _model_soundtrack(clips)
+    dest = private / "composed.mp4"
+    media.concat_clips(clips, dest, keep_audio=keep_audio)
     info = probe(dest)
-    if info.frame_count != document.duration_seconds * 30 or info.has_audio:
+    if info.frame_count != document.duration_seconds * 30 or info.has_audio != keep_audio:
         raise VideoAgentError(
             "MEDIA_EXPORT_FAILED",
             "拼接后的帧数或音轨不符合无字幕画面",
             stage="composing",
             retryable=True,
         )
-    _advance(agent, work, "visual")
+    _advance(agent, work, "visual", publication={dest: _gen_dir(agent, work) / dest.name})
 
 
-def _step_visual(agent, work: dict) -> None:
+def _generation_clips(agent, work: dict) -> list[Path]:
+    clips: list[Path] = []
+    with _transaction(agent) as conn:
+        rows = conn.execute(
+            'SELECT shot_id, status, clip_path FROM generation_shots\n               WHERE generation_id=:p0 ORDER BY ordinal',
+            {'p0': work["generation_id"]},
+        ).fetchall()
+    for row in rows:
+        shot_id, status, clip_path = row['shot_id'], row['status'], row['clip_path']
+        if status not in {"imported", "reused"} or not clip_path:
+            raise VideoAgentError("MEDIA_EXPORT_FAILED", "镜头片段尚未导入", stage="composing", retryable=True, shot_ids=[shot_id])
+        clips.append(agent.files.path_for(clip_path))
+    return clips
+
+
+def _model_soundtrack(clips: list[Path]) -> bool:
+    return bool(clips) and all(probe(path).has_audio for path in clips)
+
+
+@_private_stage
+def _step_visual(agent, work: dict, *, private: Path) -> None:
     _enter(agent, work, "visual")
     generation = _require_generation(agent, work["generation_id"])
     document = PlanDocument.model_validate_json(generation["snapshot_json"])
-    root = _gen_dir(agent, work)
-    composed = root / "composed.mp4"
+    root = private
+    shared = _gen_dir(agent, work)
+    composed = shared / "composed.mp4"
     frames: list[CheckFrame] = []
     for index, shot in enumerate(document.shots):
         positions = {
@@ -843,14 +939,17 @@ def _step_visual(agent, work: dict) -> None:
         try:
             result = agent.visual.check(frames, _appearance(document))
         except Exception as exc:
-            result = VisualResult(status="not_assessed", reason=str(exc))
+            error = redact_error(agent, VideoAgentError('PROVIDER_REJECTED', str(exc)))
+            result = VisualResult(status="not_assessed", reason=error.message)
     if result.status not in {"passed", "flagged", "not_assessed"}:
         result = VisualResult(status="not_assessed", reason="视觉检查结果无法识别")
     (root / "quality.json").write_text(result.model_dump_json(), encoding="utf-8")
-    _advance(agent, work, "export")
+    _advance(agent, work, "export", publication={path: shared / path.relative_to(root)
+             for path in root.rglob('*') if path.is_file()})
 
 
-def _step_export(agent, work: dict) -> None:
+@_private_stage
+def _step_export(agent, work: dict, *, private: Path) -> None:
     _enter(agent, work, "export")
     generation = _require_generation(agent, work["generation_id"])
     document = PlanDocument.model_validate_json(generation["snapshot_json"])
@@ -860,8 +959,13 @@ def _step_export(agent, work: dict) -> None:
     audio_bitrate = int(agent.config.audio_bitrate)
     picture = root / "composed.mp4"
     voice_cues = _read_cues(root / "cues.json")
+    want_audio = bool(document.voiceover or document.music)
+    voice = root / "voice.m4a" if document.voiceover else None
+    music = root / "music.m4a" if document.music else None
+    local_audio = (voice is not None and voice.is_file()) or (music is not None and music.is_file())
+    carried_audio = want_audio and probe(picture).has_audio and not local_audio
     if document.subtitles:
-        burned = root / "subtitled.mp4"
+        burned = private / "subtitled.mp4"
         burn_subtitles(
             picture,
             _subtitle_cues(document, voice_cues if document.voiceover else None),
@@ -869,30 +973,33 @@ def _step_export(agent, work: dict) -> None:
             height,
             burned,
             video_bitrate=video_bitrate,
+            keep_audio=carried_audio,
         )
         picture = burned
-    voice = root / "voice.m4a" if document.voiceover else None
-    music = root / "music.m4a" if document.music else None
-    tmp = root / "final.tmp.mp4"
+    tmp = private / 'final.tmp.mp4'
     try:
         with hold_lease(agent.db, work["work_id"], agent.worker_owner, agent.clock, int(agent.config.lease_seconds)):
-            mix_audio(
-                picture,
-                voice if voice is not None and voice.is_file() else None,
-                music if music is not None and music.is_file() else None,
-                voice_cues if document.voiceover and document.music else [],
-                tmp,
-                video_bitrate=video_bitrate,
-                audio_bitrate=audio_bitrate,
-            )
+            if carried_audio:
+                media.encode_av(picture, tmp, video_bitrate, audio_bitrate)
+            else:
+                mix_audio(
+                    picture,
+                    voice if voice is not None and voice.is_file() else None,
+                    music if music is not None and music.is_file() else None,
+                    voice_cues if document.voiceover and document.music else [],
+                    tmp,
+                    video_bitrate=video_bitrate,
+                    audio_bitrate=audio_bitrate,
+                )
         _assert_final(tmp, document, agent)
     except Exception:
         if tmp.is_file():
             tmp.unlink()
         raise
     final = root / "final.mp4"
-    os.replace(tmp, final)
-    _register_artifact(agent, work, generation, document, final)
+    publication = {private / name: root / name for name in ('subtitled.mp4', 'subtitled.ass')
+                   if (private / name).is_file()}
+    _register_artifact(agent, work, generation, document, final, source=tmp, publication=publication)
 
 
 def _assert_final(path: Path, document: PlanDocument, agent) -> None:
@@ -910,7 +1017,7 @@ def _assert_final(path: Path, document: PlanDocument, agent) -> None:
         raise VideoAgentError("MEDIA_EXPORT_FAILED", "成片音轨不是 AAC", stage="exporting", retryable=True)
 
 
-def _register_artifact(agent, work: dict, generation: dict, document: PlanDocument, final: Path) -> None:
+def _register_artifact(agent, work: dict, generation: dict, document: PlanDocument, final: Path, *, source=None, publication=None) -> None:
     root = final.parent
     if (root / "quality.json").is_file():
         quality = VisualResult.model_validate_json((root / "quality.json").read_text(encoding="utf-8"))
@@ -919,42 +1026,25 @@ def _register_artifact(agent, work: dict, generation: dict, document: PlanDocume
     now = agent.clock.now().isoformat()
     relative = f"tasks/{work['task_id']}/generations/{work['generation_id']}/final.mp4"
     width, height = _canvas(agent, document.aspect_ratio)
-    with _transaction(agent) as conn:
-        current = _one(conn, "SELECT COALESCE(MAX(version), 0) AS version FROM artifacts WHERE task_id=?", (work["task_id"],))
+    publication = dict(publication or {})
+    if source is not None:
+        publication[source] = final
+    transaction = _publication_transaction(agent, publication) if publication else _transaction(agent)
+    with transaction as conn:
+        current = _one(conn, 'SELECT COALESCE(MAX(version), 0) AS version FROM artifacts WHERE task_id=:p0', {'p0': work["task_id"]})
         version = int(current["version"]) + 1
         conn.execute(
-            """INSERT INTO artifacts (
-                artifact_id, task_id, generation_id, plan_version, version, duration_seconds,
-                aspect_ratio, width, height, relative_path, quality_status, quality_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                str(uuid.uuid4()),
-                work["task_id"],
-                work["generation_id"],
-                int(generation["plan_version"]),
-                version,
-                document.duration_seconds,
-                document.aspect_ratio,
-                width,
-                height,
-                relative,
-                quality.status,
-                quality.model_dump_json(),
-                now,
-            ),
+            'INSERT INTO artifacts (\n                artifact_id, task_id, generation_id, plan_version, version, duration_seconds,\n                aspect_ratio, width, height, relative_path, quality_status, quality_json, created_at\n            ) VALUES (:p0, :p1, :p2, :p3, :p4, :p5, :p6, :p7, :p8, :p9, :p10, :p11, :p12)',
+            {'p0': str(uuid.uuid4()), 'p1': work["task_id"], 'p2': work["generation_id"], 'p3': int(generation["plan_version"]), 'p4': version, 'p5': document.duration_seconds, 'p6': document.aspect_ratio, 'p7': width, 'p8': height, 'p9': relative, 'p10': quality.status, 'p11': quality.model_dump_json(), 'p12': now},
         )
         conn.execute(
-            """UPDATE generations
-               SET status='succeeded', stage='exporting', stage_detail='成片已导出',
-                   failure_code=NULL, failure_message=NULL, failure_stage=NULL,
-                   failure_retryable=NULL, failure_details_json=NULL, updated_at=?
-               WHERE generation_id=?""",
-            (now, work["generation_id"]),
+            "UPDATE generations\n               SET status='succeeded', stage='exporting', stage_detail='成片已导出',\n                   failure_code=NULL, failure_message=NULL, failure_stage=NULL,\n                   failure_retryable=NULL, failure_details_json=NULL, updated_at=:p0\n               WHERE generation_id=:p1",
+            {'p0': now, 'p1': work["generation_id"]},
         )
         task = _one(
             conn,
-            "SELECT head_plan_version, confirmed_plan_version FROM tasks WHERE task_id=?",
-            (work["task_id"],),
+            'SELECT head_plan_version, confirmed_plan_version FROM tasks WHERE task_id=:p0',
+            {'p0': work["task_id"]},
         )
         plan_version = int(generation["plan_version"])
         if task["head_plan_version"] == plan_version and task["confirmed_plan_version"] == plan_version:
@@ -962,19 +1052,12 @@ def _register_artifact(agent, work: dict, generation: dict, document: PlanDocume
         else:
             status = "awaiting_confirmation"
         conn.execute(
-            """UPDATE tasks
-               SET status=?, stage=NULL, stage_detail=NULL, failure_scope=NULL,
-                   failure_code=NULL, failure_message=NULL, failure_stage=NULL,
-                   failure_retryable=NULL, failure_details_json=NULL,
-                   completed_shots=NULL, total_shots=NULL, updated_at=?
-               WHERE task_id=?""",
-            (status, now, work["task_id"]),
+            'UPDATE tasks\n               SET status=:p0, stage=NULL, stage_detail=NULL, failure_scope=NULL,\n                   failure_code=NULL, failure_message=NULL, failure_stage=NULL,\n                   failure_retryable=NULL, failure_details_json=NULL,\n                   completed_shots=NULL, total_shots=NULL, updated_at=:p1\n               WHERE task_id=:p2',
+            {'p0': status, 'p1': now, 'p2': work["task_id"]},
         )
         conn.execute(
-            """UPDATE work_items
-               SET done=1, lease_owner=NULL, lease_until=NULL, next_attempt_at=NULL
-               WHERE work_id=?""",
-            (work["work_id"],),
+            'UPDATE work_items\n               SET done=1, lease_owner=NULL, lease_until=NULL, next_attempt_at=NULL\n               WHERE work_id=:p0',
+            {'p0': work["work_id"]},
         )
 
 
@@ -1022,8 +1105,8 @@ def _base_generation_dir(agent, generation: dict) -> Path | None:
     with _transaction(agent) as conn:
         row = _one(
             conn,
-            "SELECT task_id, generation_id FROM artifacts WHERE artifact_id=?",
-            (generation["base_artifact_id"],),
+            'SELECT task_id, generation_id FROM artifacts WHERE artifact_id=:p0',
+            {'p0': generation["base_artifact_id"]},
         )
     if row is None:
         return None
@@ -1048,45 +1131,46 @@ def _copy_base_audio(agent, generation: dict, root: Path, document: PlanDocument
         raise VideoAgentError("MEDIA_EXPORT_FAILED", "基础字幕时间不存在", stage="preparing_audio", retryable=True)
 
 
-def _reuse_base_shots(agent, work: dict, generation: dict, document: PlanDocument) -> None:
+@_private_stage
+def _reuse_base_shots(agent, work: dict, generation: dict, document: PlanDocument, *, private: Path) -> None:
     base = _base_generation_dir(agent, generation)
     if base is None:
         raise VideoAgentError("MEDIA_EXPORT_FAILED", "找不到基础成品的执行目录", stage="preparing_first_frame", retryable=True)
     root = _gen_dir(agent, work)
-    (root / "shots").mkdir(parents=True, exist_ok=True)
     with _transaction(agent) as conn:
         existing = {
-            row[0]
+            row['shot_id']
             for row in conn.execute(
-                "SELECT shot_id FROM generation_shots WHERE generation_id=?",
-                (generation["generation_id"],),
+                'SELECT shot_id FROM generation_shots WHERE generation_id=:p0',
+                {'p0': generation["generation_id"]},
             )
         }
+    publication = {}
+    for shot in document.shots:
+        if shot.shot_id in existing:
+            continue
+        source = base / "shots" / f"{shot.shot_id}.mp4"
+        if not source.is_file():
+            raise VideoAgentError(
+                "MEDIA_EXPORT_FAILED", "基础镜头片段不存在", stage="preparing_first_frame",
+                retryable=True, shot_ids=[shot.shot_id],
+            )
+        candidate = private / f"{shot.shot_id}.mp4"
+        shutil.copyfile(source, candidate)
+        publication[candidate] = root / "shots" / candidate.name
+    with _publication_transaction(agent, publication) as conn:
         for index, shot in enumerate(document.shots):
             if shot.shot_id in existing:
                 conn.execute(
-                    "UPDATE generation_shots SET ordinal=? WHERE generation_id=? AND shot_id=?",
-                    (index, generation["generation_id"], shot.shot_id),
+                    'UPDATE generation_shots SET ordinal=:p0 WHERE generation_id=:p1 AND shot_id=:p2',
+                    {'p0': index, 'p1': generation["generation_id"], 'p2': shot.shot_id},
                 )
                 continue
-            source = base / "shots" / f"{shot.shot_id}.mp4"
-            if not source.is_file():
-                raise VideoAgentError(
-                    "MEDIA_EXPORT_FAILED",
-                    "基础镜头片段不存在",
-                    stage="preparing_first_frame",
-                    retryable=True,
-                    shot_ids=[shot.shot_id],
-                )
             dest = root / "shots" / f"{shot.shot_id}.mp4"
-            if not dest.is_file():
-                shutil.copyfile(source, dest)
             relative = dest.relative_to(agent.files.home).as_posix()
             conn.execute(
-                """INSERT INTO generation_shots (
-                    generation_id, shot_id, ordinal, start_frame, end_frame, status, clip_path
-                ) VALUES (?, ?, ?, ?, ?, 'reused', ?)""",
-                (generation["generation_id"], shot.shot_id, index, shot.start_frame, shot.end_frame, relative),
+                "INSERT INTO generation_shots (\n                    generation_id, shot_id, ordinal, start_frame, end_frame, status, clip_path\n                ) VALUES (:p0, :p1, :p2, :p3, :p4, 'reused', :p5)",
+                {'p0': generation["generation_id"], 'p1': shot.shot_id, 'p2': index, 'p3': shot.start_frame, 'p4': shot.end_frame, 'p5': relative},
             )
 
 
@@ -1096,7 +1180,7 @@ def _replacing_ids(generation: dict, document: PlanDocument) -> set[str]:
     return set(json.loads(generation["shot_ids_json"]))
 
 
-def _neighbor_media(agent, work: dict, generation: dict, document: PlanDocument, shot_row: dict):
+def _neighbor_media(agent, work: dict, generation: dict, document: PlanDocument, shot_row: dict, *, private=None):
     plan_shots = list(document.shots)
     index = next(position for position, item in enumerate(plan_shots) if item.shot_id == shot_row["shot_id"])
     replacing = _replacing_ids(generation, document)
@@ -1112,7 +1196,8 @@ def _neighbor_media(agent, work: dict, generation: dict, document: PlanDocument,
             clip = None if base is None else base / "shots" / f"{left.shot_id}.mp4"
         if clip is None or not clip.is_file():
             raise VideoAgentError("MEDIA_EXPORT_FAILED", "左侧相邻镜头片段不存在", stage="generating_shots", retryable=True, shot_ids=[left.shot_id])
-        dest = _gen_dir(agent, work) / "frames" / f"{left.shot_id}-taken-end.png"
+        private = private if private is not None else _scratch_dir(agent, work) / uuid.uuid4().hex[:8]
+        dest = private / f"{left.shot_id}-taken-end.png"
         dest.parent.mkdir(parents=True, exist_ok=True)
         extract_png(clip, probe(clip).frame_count - 1, dest)
         first_path = dest
@@ -1123,7 +1208,8 @@ def _neighbor_media(agent, work: dict, generation: dict, document: PlanDocument,
             clip = None if base is None else base / "shots" / f"{right.shot_id}.mp4"
             if clip is None or not clip.is_file():
                 raise VideoAgentError("MEDIA_EXPORT_FAILED", "右侧相邻镜头片段不存在", stage="generating_shots", retryable=True, shot_ids=[right.shot_id])
-            dest = _gen_dir(agent, work) / "frames" / f"{right.shot_id}-taken-start.png"
+            private = private if private is not None else _scratch_dir(agent, work) / uuid.uuid4().hex[:8]
+            dest = private / f"{right.shot_id}-taken-start.png"
             dest.parent.mkdir(parents=True, exist_ok=True)
             extract_png(clip, 0, dest)
             tail_path = dest

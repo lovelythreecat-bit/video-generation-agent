@@ -187,7 +187,11 @@ def test_live_lease_is_renewed_without_running_the_step_twice(tmp_path: Path):
         sleeper.renewed.clear()
         sleeper.release()
         assert sleeper.renewed.wait(timeout=5)
-        until = read_rows(agent.home, "SELECT lease_until FROM work_items WHERE task_id=?", (task.task_id,))[0]["lease_until"]
+        until = read_rows(
+            agent.home,
+            "SELECT lease_until FROM work_items WHERE task_id=? AND kind='generation'",
+            (task.task_id,),
+        )[0]["lease_until"]
         assert until == (agent.clock.now() + timedelta(seconds=60)).isoformat()
         assert agent.recover() == 0
         assert agent.tick().did_work is False

@@ -1,0 +1,27 @@
+{
+  "mode": "fake",
+  "duration_tiers": [5, 10, 15, 30],
+  "default_duration": 10,
+  "max_images": 12,
+  "max_file_bytes": 20971520,
+  "video_bitrate": 8000000,
+  "audio_bitrate": 192000,
+  "lease_seconds": 60,
+  "resolutions": {
+    "9:16": [1080, 1920],
+    "16:9": [1920, 1080],
+    "1:1": [1080, 1080],
+    "4:5": [1080, 1350],
+    "3:4": [1080, 1440],
+    "4:3": [1440, 1080],
+    "3:2": [1620, 1080],
+    "2:3": [1080, 1620]
+  },
+  "adapters": {
+    "planner": {"adapter": "fake"},
+    "video": {"adapter": "fake"},
+    "voice": {"adapter": "fake"},
+    "music": {"adapter": "fake"},
+    "visual": {"adapter": "none"}
+  }
+}

@@ -4,13 +4,14 @@ import os
 import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk
 
 from video_agent import VideoAgentError
 from video_agent.config import load_config
 from video_agent.media import ffmpeg_available
 from video_agent.models import ShotTextPatch
 
+from desktop_app.copyable import SelectableText, copy_to_clipboard, show_message
 from desktop_app.viewmodel import (
     ASPECT_RATIOS,
     FIRST_FRAME_NONE,
@@ -26,6 +27,7 @@ from desktop_app.viewmodel import (
     button_states_for,
     command_enabled,
     error_dialog_text,
+    failure_clipboard_text,
     failure_text,
     ffmpeg_label,
     first_frame_asset_id,
@@ -115,8 +117,12 @@ class MainWindow(tk.Tk):
 
         question_box = ttk.LabelFrame(body, text="需要补充", padding=8)
         question_box.pack(fill="x", pady=4)
-        self.question_text = ttk.Label(question_box, text="", justify="left")
-        self.question_text.pack(anchor="w")
+        question_actions = ttk.Frame(question_box)
+        question_actions.pack(fill="x")
+        self._copy_question_button = ttk.Button(question_actions, text="复制", command=self._copy_question)
+        self._copy_question_button.pack(side="right")
+        self.question_text = SelectableText(question_box, height=2, max_height=6)
+        self.question_text.pack(fill="x")
 
         demand = ttk.LabelFrame(body, text="需求", padding=8)
         demand.pack(fill="x", pady=4)
@@ -126,11 +132,10 @@ class MainWindow(tk.Tk):
         self.duration_var = tk.StringVar(value=str(self.default_duration))
         self.aspect_var = tk.StringVar(value="9:16")
         self.subtitles_var = tk.BooleanVar(value=True)
-        self.voiceover_var = tk.BooleanVar(value=True)
-        self.music_var = tk.BooleanVar(value=True)
-        self.language_var = tk.StringVar()
-        self.voice_pref_var = tk.StringVar()
-        self.music_dir_var = tk.StringVar()
+        self.sound_var = tk.BooleanVar(value=True)
+        self._language = ""
+        self._voice_preference = ""
+        self._music_direction = ""
         self.first_frame_var = tk.StringVar(value=FIRST_FRAME_NONE)
         self._entry(demand, "产品名称", self.name_var)
         self._entry(demand, "品类", self.category_var)
@@ -146,24 +151,15 @@ class MainWindow(tk.Tk):
         switches = ttk.Frame(demand)
         switches.pack(anchor="w", pady=2)
         ttk.Checkbutton(switches, text="字幕", variable=self.subtitles_var).pack(side="left")
-        ttk.Checkbutton(switches, text="配音", variable=self.voiceover_var).pack(side="left")
-        ttk.Checkbutton(switches, text="音乐", variable=self.music_var).pack(side="left")
-        self._entry(demand, "配音语言", self.language_var)
-        self._entry(demand, "配音偏好", self.voice_pref_var)
-        self._entry(demand, "音乐说明", self.music_dir_var)
+        ttk.Checkbutton(switches, text="有声", variable=self.sound_var).pack(side="left")
         picture_row = ttk.Frame(demand)
         picture_row.pack(fill="x", pady=2)
         ttk.Button(picture_row, text="添加图片", command=self._add_images).pack(side="left")
         ttk.Button(picture_row, text="移除选中图片", command=self._remove_image).pack(side="left", padx=4)
         ttk.Button(picture_row, text="清空图片", command=self._clear_images).pack(side="left")
-        ttk.Button(picture_row, text="选择音乐文件", command=self._add_music).pack(side="left", padx=4)
         self.image_list = tk.Listbox(demand, height=4, exportselection=False)
         self.image_list.pack(fill="x")
         self.first_frame_box = self._combo(demand, "首帧", self.first_frame_var, [FIRST_FRAME_NONE])
-        self.music_label = ttk.Label(demand, text="已登记音乐：")
-        self.music_label.pack(anchor="w")
-        self.clear_music_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(demand, text="清除已登记音乐", variable=self.clear_music_var).pack(anchor="w")
         demand_buttons = ttk.Frame(demand)
         demand_buttons.pack(anchor="w", pady=4)
         self._buttons["create"] = ttk.Button(demand_buttons, text="创建任务", command=self._create_clicked)
@@ -179,11 +175,8 @@ class MainWindow(tk.Tk):
         self.plan_aspect_var = tk.StringVar(value="9:16")
         self.plan_fit_var = tk.StringVar(value="pad")
         self.plan_subtitles_var = tk.BooleanVar(value=True)
-        self.plan_voiceover_var = tk.BooleanVar(value=True)
-        self.plan_music_var = tk.BooleanVar(value=True)
+        self.plan_sound_var = tk.BooleanVar(value=True)
         self.plan_language_var = tk.StringVar()
-        self.plan_voice_var = tk.StringVar()
-        self.plan_music_dir_var = tk.StringVar()
         self.instruction_var = tk.StringVar()
         self.plan_duration_box = self._combo(plan, "方案时长", self.plan_duration_var, [str(item) for item in self.duration_tiers])
         self._combo(plan, "方案比例", self.plan_aspect_var, list(ASPECT_RATIOS))
@@ -191,11 +184,8 @@ class MainWindow(tk.Tk):
         plan_switches = ttk.Frame(plan)
         plan_switches.pack(anchor="w")
         ttk.Checkbutton(plan_switches, text="字幕", variable=self.plan_subtitles_var).pack(side="left")
-        ttk.Checkbutton(plan_switches, text="配音", variable=self.plan_voiceover_var).pack(side="left")
-        ttk.Checkbutton(plan_switches, text="音乐", variable=self.plan_music_var).pack(side="left")
+        ttk.Checkbutton(plan_switches, text="有声", variable=self.plan_sound_var).pack(side="left")
         self._entry(plan, "方案语言", self.plan_language_var)
-        self._entry(plan, "方案配音偏好", self.plan_voice_var)
-        self._entry(plan, "方案音乐说明", self.plan_music_dir_var)
         ttk.Label(plan, text="镜头文案").pack(anchor="w")
         self.shot_editor = ttk.Frame(plan)
         self.shot_editor.pack(fill="x")
@@ -211,8 +201,12 @@ class MainWindow(tk.Tk):
 
         execution = ttk.LabelFrame(body, text="执行", padding=8)
         execution.pack(fill="x", pady=4)
-        self.execution_text = ttk.Label(execution, text="", justify="left")
-        self.execution_text.pack(anchor="w")
+        execution_actions = ttk.Frame(execution)
+        execution_actions.pack(fill="x")
+        self._copy_execution_button = ttk.Button(execution_actions, text="复制", command=self._copy_execution)
+        self._copy_execution_button.pack(side="right")
+        self.execution_text = SelectableText(execution, height=3, max_height=6)
+        self.execution_text.pack(fill="x")
         self.artifact_frame = ttk.Frame(execution)
         self.artifact_frame.pack(fill="x", pady=4)
         ttk.Label(execution, text="按镜头重生成（勾选来自最新成功成品的方案）").pack(anchor="w")
@@ -231,15 +225,21 @@ class MainWindow(tk.Tk):
 
         bottom = ttk.LabelFrame(self, text="最近一次错误", padding=8)
         bottom.grid(row=2, column=0, columnspan=2, sticky="ew", padx=8, pady=8)
-        self.code_value = ttk.Label(bottom, text="")
-        self.message_value = ttk.Label(bottom, text="")
-        self.stage_value = ttk.Label(bottom, text="")
-        ttk.Label(bottom, text="错误码").grid(row=0, column=0, sticky="w")
-        self.code_value.grid(row=0, column=1, sticky="w", padx=8)
-        ttk.Label(bottom, text="说明").grid(row=1, column=0, sticky="w")
-        self.message_value.grid(row=1, column=1, sticky="w", padx=8)
-        ttk.Label(bottom, text="阶段").grid(row=2, column=0, sticky="w")
-        self.stage_value.grid(row=2, column=1, sticky="w", padx=8)
+        bottom.columnconfigure(1, weight=1)
+        self.code_value = SelectableText(bottom, height=1, max_height=2)
+        self.message_value = SelectableText(bottom, height=2, max_height=6)
+        self.stage_value = SelectableText(bottom, height=1, max_height=3)
+        ttk.Label(bottom, text="错误码").grid(row=0, column=0, sticky="nw")
+        self.code_value.grid(row=0, column=1, sticky="ew", padx=8)
+        ttk.Label(bottom, text="说明").grid(row=1, column=0, sticky="nw")
+        self.message_value.grid(row=1, column=1, sticky="ew", padx=8)
+        ttk.Label(bottom, text="阶段").grid(row=2, column=0, sticky="nw")
+        self.stage_value.grid(row=2, column=1, sticky="ew", padx=8)
+        self._copy_failure_button = ttk.Button(bottom, text="复制", command=self._copy_failure)
+        self._copy_failure_button.grid(row=0, column=2, rowspan=3, sticky="ne")
+        self._copy_question_button.configure(state="disabled")
+        self._copy_execution_button.configure(state="disabled")
+        self._copy_failure_button.configure(state="disabled")
 
     def _entry(self, parent, label: str, variable: tk.StringVar) -> None:
         row = ttk.Frame(parent)
@@ -258,12 +258,13 @@ class MainWindow(tk.Tk):
     def _open_settings(self) -> None:
         from desktop_app.settings_dialog import open_settings
 
-        open_settings(self, self.home, on_saved=self._apply_saved_mode)
+        open_settings(self, self.home, on_saved=self._apply_saved_mode, agent=self.agent)
 
     def _apply_saved_mode(self, mode: str) -> None:
         self.mode = mode
         self.mode_text.configure(text=mode_label(mode))
-        config = load_config(self.home)
+        service = getattr(self.agent, "settings_service", None)
+        config = service.read_effective_config() if service is not None else load_config(self.home)
         self.duration_tiers = list(config.duration_tiers)
         self.default_duration = int(config.default_duration)
         self.max_images = int(config.max_images)
@@ -274,6 +275,11 @@ class MainWindow(tk.Tk):
             self.duration_var.set(values[0])
         if self.plan_duration_var.get() not in values and values:
             self.plan_duration_var.set(values[0])
+        if service is None:
+            try:
+                self.agent.reload_adapters()
+            except VideoAgentError as exc:
+                show_message(self, "设置已保存，当前进程还没换成新接口", exc.message)
 
     def refresh_tasks(self) -> None:
         selected = self.selected_id
@@ -311,14 +317,16 @@ class MainWindow(tk.Tk):
 
     def _render_status(self) -> None:
         code, message, stage = failure_text(self.current)
-        self.code_value.configure(text=code)
-        self.message_value.configure(text=message)
-        self.stage_value.configure(text=stage)
-        self.question_text.configure(text=question_text(self.current))
-        if self.current is None:
-            self.execution_text.configure(text="")
-        else:
-            self.execution_text.configure(text=format_execution(self.current))
+        self.code_value.set_text(code)
+        self.message_value.set_text(message)
+        self.stage_value.set_text(stage)
+        self._set_copy_enabled(self._copy_failure_button, code, message, stage)
+        questions = question_text(self.current)
+        self.question_text.set_text(questions)
+        self._set_copy_enabled(self._copy_question_button, questions)
+        execution = "" if self.current is None else format_execution(self.current)
+        self.execution_text.set_text(execution)
+        self._set_copy_enabled(self._copy_execution_button, execution)
         self._apply_buttons()
 
     def _load_head(self):
@@ -349,7 +357,6 @@ class MainWindow(tk.Tk):
         self.prompt_text.delete("1.0", "end")
         self.prompt_text.insert("1.0", task.user_prompt)
         self.instruction_var.set("")
-        self.clear_music_var.set(False)
         self._image_ids = list(task.image_asset_ids)
         self._image_names = list(task.image_asset_ids)
         self.image_list.delete(0, "end")
@@ -365,13 +372,11 @@ class MainWindow(tk.Tk):
             self.duration_var.set(str(duration))
             self.aspect_var.set(video.aspect_ratio)
             self.subtitles_var.set(video.subtitles)
-            self.voiceover_var.set(video.voiceover)
-            self.music_var.set(video.music)
-            self.language_var.set(audio.language or "")
-            self.voice_pref_var.set(audio.voice_preference)
-            self.music_dir_var.set(audio.music_direction)
+            self.sound_var.set(bool(video.voiceover or video.music))
+            self._language = audio.language or ""
+            self._voice_preference = audio.voice_preference
+            self._music_direction = audio.music_direction
             self._music_asset_id = audio.music_asset_id
-            self.music_label.configure(text=f"已登记音乐：{audio.music_asset_id or ''}")
             self.plan_duration_var.set(str(self.default_duration))
             self.plan_aspect_var.set("9:16")
             self.plan_fit_var.set("pad")
@@ -383,22 +388,17 @@ class MainWindow(tk.Tk):
         self.duration_var.set(str(doc.duration_seconds))
         self.aspect_var.set(doc.aspect_ratio)
         self.subtitles_var.set(doc.subtitles)
-        self.voiceover_var.set(doc.voiceover)
-        self.music_var.set(doc.music)
-        self.language_var.set(doc.language or "")
-        self.voice_pref_var.set(doc.voice_preference)
-        self.music_dir_var.set(doc.music_direction)
+        self.sound_var.set(bool(doc.voiceover or doc.music))
+        self._language = doc.language or ""
+        self._voice_preference = doc.voice_preference
+        self._music_direction = doc.music_direction
         self.plan_duration_var.set(str(doc.duration_seconds))
         self.plan_aspect_var.set(doc.aspect_ratio)
         self.plan_fit_var.set(doc.fit)
         self.plan_subtitles_var.set(doc.subtitles)
-        self.plan_voiceover_var.set(doc.voiceover)
-        self.plan_music_var.set(doc.music)
+        self.plan_sound_var.set(bool(doc.voiceover or doc.music))
         self.plan_language_var.set(doc.language or "")
-        self.plan_voice_var.set(doc.voice_preference)
-        self.plan_music_dir_var.set(doc.music_direction)
         self._music_asset_id = doc.music_asset_id
-        self.music_label.configure(text=f"已登记音乐：{doc.music_asset_id or ''}")
         self._set_first_frame(doc.first_frame_asset_id, doc.first_frame_source)
         self._rebuild_shot_editors(self.head_plan)
 
@@ -502,7 +502,7 @@ class MainWindow(tk.Tk):
         try:
             call(new_idempotency_key())
         except VideoAgentError as exc:
-            messagebox.showerror("操作被拒绝", error_dialog_text(exc.code, exc.message, exc.stage), parent=self)
+            show_message(self, "操作被拒绝", error_dialog_text(exc.code, exc.message, exc.stage))
         finally:
             self._busy = False
             self.refresh_tasks()
@@ -523,11 +523,11 @@ class MainWindow(tk.Tk):
             duration_seconds=int(self.duration_var.get()),
             aspect_ratio=self.aspect_var.get(),
             subtitles=bool(self.subtitles_var.get()),
-            voiceover=bool(self.voiceover_var.get()),
-            music=bool(self.music_var.get()),
-            language=self.language_var.get(),
-            voice_preference=self.voice_pref_var.get(),
-            music_direction=self.music_dir_var.get(),
+            voiceover=bool(self.sound_var.get()),
+            music=bool(self.sound_var.get()),
+            language=self._language,
+            voice_preference=self._voice_preference,
+            music_direction=self._music_direction,
             music_asset_id=self._music_asset_id,
         )
 
@@ -553,20 +553,35 @@ class MainWindow(tk.Tk):
             aspect_ratio=self.plan_aspect_var.get(),
             fit=self.plan_fit_var.get(),
             subtitles=bool(self.plan_subtitles_var.get()),
-            voiceover=bool(self.plan_voiceover_var.get()),
-            music=bool(self.plan_music_var.get()),
+            voiceover=bool(self.plan_sound_var.get()),
+            music=bool(self.plan_sound_var.get()),
             language=self.plan_language_var.get(),
-            voice_preference=self.plan_voice_var.get(),
-            music_direction=self.plan_music_dir_var.get(),
+            voice_preference=self._voice_preference,
+            music_direction=self._music_direction,
             music_asset_id=self._music_asset_id,
-            clear_music_asset=bool(self.clear_music_var.get()),
+            clear_music_asset=False,
             first_frame_asset_id=None if clear_first else first_frame_asset_id(label),
             clear_first_frame=clear_first,
             shot_texts=texts,
         )
 
     def _show_error(self, exc: VideoAgentError) -> None:
-        messagebox.showerror("操作被拒绝", error_dialog_text(exc.code, exc.message, exc.stage), parent=self)
+        show_message(self, "操作被拒绝", error_dialog_text(exc.code, exc.message, exc.stage))
+
+    def _set_copy_enabled(self, button: ttk.Button, *parts: str) -> None:
+        button.configure(state="normal" if any(part.strip() for part in parts) else "disabled")
+
+    def _copy_failure(self) -> None:
+        copy_to_clipboard(
+            self,
+            failure_clipboard_text(self.code_value.get_text(), self.message_value.get_text(), self.stage_value.get_text()),
+        )
+
+    def _copy_question(self) -> None:
+        copy_to_clipboard(self, self.question_text.get_text())
+
+    def _copy_execution(self) -> None:
+        copy_to_clipboard(self, self.execution_text.get_text())
 
     def _add_images(self) -> None:
         paths = filedialog.askopenfilenames(
@@ -576,7 +591,7 @@ class MainWindow(tk.Tk):
         )
         for path in paths:
             if len(self._image_ids) >= self.max_images:
-                messagebox.showerror("图片过多", f"最多 {self.max_images} 张产品图片", parent=self)
+                show_message(self, "图片过多", f"最多 {self.max_images} 张产品图片")
                 break
             try:
                 asset_id = self.agent.register_asset(filename=Path(path).name, kind="image", path=Path(path))
@@ -614,22 +629,6 @@ class MainWindow(tk.Tk):
         self._image_names = []
         self._images_changed = True
         self._refresh_image_list()
-
-    def _add_music(self) -> None:
-        path = filedialog.askopenfilename(
-            parent=self,
-            title="选择音乐",
-            filetypes=[("音频", "*.mp3 *.wav *.m4a"), ("全部", "*.*")],
-        )
-        if not path:
-            return
-        try:
-            self._music_asset_id = self.agent.register_asset(filename=Path(path).name, kind="audio", path=Path(path))
-        except VideoAgentError as exc:
-            self._show_error(exc)
-            return
-        self.clear_music_var.set(False)
-        self.music_label.configure(text=f"已登记音乐：{self._music_asset_id}")
 
     def _create_clicked(self) -> None:
         def call(key: str) -> None:
@@ -669,6 +668,9 @@ class MainWindow(tk.Tk):
         self._invoke(call)
 
     def _regenerate_full_clicked(self) -> None:
+        if self._block_rerun_of_confirmed_plan():
+            return
+
         def call(key: str) -> None:
             if self.current is None:
                 return
@@ -676,6 +678,9 @@ class MainWindow(tk.Tk):
         self._invoke(call)
 
     def _regenerate_shots_clicked(self) -> None:
+        if self._block_rerun_of_confirmed_plan():
+            return
+
         def call(key: str) -> None:
             if self.current is None or not self.artifacts:
                 return
@@ -700,6 +705,17 @@ class MainWindow(tk.Tk):
                 return
             self.agent.retry_generation(self.current.generation_id, idempotency_key=key)
         self._invoke(call)
+
+    def _block_rerun_of_confirmed_plan(self) -> bool:
+        task = self.current
+        if task is None or task.head_plan_version is None or task.head_plan_version == task.confirmed_plan_version:
+            return False
+        show_message(
+            self,
+            "请先确认方案",
+            "当前方案还没确认。请点「确认当前方案」，生成才会使用这份方案里的首帧。",
+        )
+        return True
 
     def _open_artifact(self, artifact_id: str) -> None:
         try:
@@ -730,7 +746,8 @@ class MainWindow(tk.Tk):
 
 
 def run(agent, home: Path, stop_event: threading.Event) -> None:
-    config = load_config(home)
+    service = getattr(agent, "settings_service", None)
+    config = service.read_effective_config() if service is not None else load_config(home)
     window = MainWindow(
         agent,
         home,

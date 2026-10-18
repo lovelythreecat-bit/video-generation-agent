@@ -61,6 +61,7 @@ class ShotRequest(BaseModel):
     width: int
     height: int
     provider_idempotency_key: str
+    with_audio: bool = False
 
 
 class SubmitResult(BaseModel):

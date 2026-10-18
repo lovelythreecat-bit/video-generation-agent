@@ -155,6 +155,97 @@ def test_illegal_settings_patch_does_not_write(tmp_path: Path):
     assert (tmp_path / "config.json").read_bytes() == before
 
 
+def test_real_mode_saves_text_and_video_endpoints(tmp_path: Path):
+    _write(tmp_path, _valid())
+    saved = save_settings(
+        tmp_path,
+        SettingsPatch(
+            mode="real",
+            planner=AdapterSetting(
+                adapter="openai_chat",
+                fields={
+                    "base_url": "https://api.deepseek.com/v1",
+                    "api_key": "sk-test",
+                    "model": "deepseek-chat",
+                },
+            ),
+            video=AdapterSetting(
+                adapter="seedance",
+                fields={
+                    "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+                    "api_key": "ark-test",
+                    "model": "doubao-seedance",
+                },
+            ),
+        ),
+    )
+    assert saved.mode == "real"
+    assert saved.adapters["planner"].adapter == "openai_chat"
+    assert saved.adapters["planner"].field_map()["model"] == "deepseek-chat"
+    assert saved.adapters["video"].field_map()["api_key"] == "ark-test"
+
+
+def test_real_mode_names_the_missing_text_key(tmp_path: Path):
+    _write(tmp_path, _valid())
+    before = (tmp_path / "config.json").read_bytes()
+    with pytest.raises(VideoAgentError) as caught:
+        save_settings(
+            tmp_path,
+            SettingsPatch(
+                mode="real",
+                planner=AdapterSetting(
+                    adapter="openai_chat",
+                    fields={"base_url": "https://api.deepseek.com/v1", "api_key": "", "model": "deepseek-chat"},
+                ),
+                video=AdapterSetting(
+                    adapter="seedance",
+                    fields={
+                        "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+                        "api_key": "ark-test",
+                        "model": "doubao-seedance",
+                    },
+                ),
+            ),
+        )
+    assert caught.value.code == "VALIDATION_ERROR"
+    assert "文本大模型还没填 API Key" in caught.value.message
+    assert (tmp_path / "config.json").read_bytes() == before
+
+
+def test_wan_segment_rejects_out_of_range(tmp_path: Path):
+    _write(tmp_path, _valid())
+    before = (tmp_path / "config.json").read_bytes()
+    planner = AdapterSetting(
+        adapter="openai_chat",
+        fields={
+            "base_url": "https://api.deepseek.com/v1",
+            "api_key": "sk-test",
+            "model": "deepseek-chat",
+        },
+    )
+    for raw in ("0", "1.5"):
+        with pytest.raises(VideoAgentError) as caught:
+            save_settings(
+                tmp_path,
+                SettingsPatch(
+                    mode="real",
+                    planner=planner,
+                    video=AdapterSetting(
+                        adapter="wan",
+                        fields={
+                            "base_url": "https://llm.example.invalid/api/v1",
+                            "api_key": "sk-wan",
+                            "model": "wan2.2-i2v-flash",
+                            "max_segment_seconds": raw,
+                        },
+                    ),
+                ),
+            )
+        assert caught.value.code == "VALIDATION_ERROR"
+        assert "要填 1 到 15 的整数" in caught.value.message
+        assert (tmp_path / "config.json").read_bytes() == before
+
+
 def test_unreadable_json_is_not_rewritten(tmp_path: Path):
     path = tmp_path / "config.json"
     path.write_text("{", encoding="utf-8")
@@ -163,3 +254,15 @@ def test_unreadable_json_is_not_rewritten(tmp_path: Path):
         load_config(tmp_path)
     assert caught.value.code == "VALIDATION_ERROR"
     assert path.read_bytes() == before
+
+
+def test_public_settings_reject_boolean_numbers_and_repr_hides_nested_credentials():
+    from pydantic import ValidationError
+    from video_agent.config import validate_config
+    with pytest.raises(ValidationError):
+        SettingsPatch(max_images=True)
+    payload = _valid()
+    payload['adapters']['planner']['headers'] = {'Authorization': 'nested-credential'}
+    config = validate_config(payload)
+    assert 'nested-credential' not in repr(config)
+    assert 'nested-credential' not in str(config)

@@ -222,6 +222,8 @@ def test_lease_and_claim_order(tmp_path: Path):
     first = agent.create_task(CreateTaskRequest(images=[image_id], product_info=ProductInfo(name="先")))
     with agent.db.transaction() as conn:
         work_id = conn.execute("SELECT work_id FROM work_items WHERE task_id=?", (first.task_id,)).fetchone()["work_id"]
+        from video_agent.worker import _claim
+        _claim(conn, owner=agent.worker_owner, now_iso=clock.now().isoformat(), lease_until='2026-10-09T03:00:15+00:00')
     with hold_lease(agent.db, work_id, agent.worker_owner, clock, 15):
         with agent.db.transaction() as conn:
             row = conn.execute("SELECT lease_owner, lease_until FROM work_items WHERE work_id=?", (work_id,)).fetchone()
@@ -256,3 +258,71 @@ def test_lease_and_claim_order(tmp_path: Path):
     assert blocked.tick().task_id == later.task_id
     blocked_clock.advance(3600)
     assert blocked.tick().task_id == earlier.task_id
+
+
+def test_late_download_cannot_overwrite_published_clip(tmp_path, monkeypatch):
+    from tests.recovery_support import make_agent, open_plan, read_rows, capabilities
+    from types import SimpleNamespace
+    agent = make_agent(tmp_path)
+    task, _ = open_plan(agent)
+    confirmed = agent.confirm(task.task_id, 1)
+    generation_id = confirmed.generation_id
+    root = agent.home / 'tasks' / task.task_id / 'generations' / generation_id
+    published = root / 'shots' / 's1.mp4'
+    published.parent.mkdir(parents=True)
+    published.write_bytes(b'new-owner-clip')
+    with agent.db.transaction() as conn:
+        conn.execute("UPDATE work_items SET step='import_shot' WHERE generation_id=:id", {'id': generation_id})
+        conn.execute("UPDATE generations SET stage_detail='download' WHERE generation_id=:id", {'id': generation_id})
+        conn.execute("UPDATE generation_shots SET status='submitted', external_task_id='remote', submission_state='accepted' WHERE generation_id=:id", {'id': generation_id})
+    class LateVideo:
+        def capabilities(self): return capabilities()
+        def download(self, external_task_id):
+            agent.clock.advance(61)
+            with agent.db.transaction() as conn:
+                conn.execute("UPDATE work_items SET lease_owner='new-owner', lease_until='2026-10-09T01:00:00+00:00' WHERE generation_id=:id", {'id': generation_id})
+            return b'old-owner-clip'
+    agent.video = LateVideo()
+    monkeypatch.setattr('video_agent.pipeline.probe', lambda *_: SimpleNamespace(frame_count=150, has_audio=False))
+    agent.tick()
+    assert published.read_bytes() == b'new-owner-clip'
+    row = read_rows(agent.home, 'SELECT status, clip_path FROM generation_shots WHERE generation_id=?', (generation_id,))[0]
+    assert row['status'] == 'submitted' and row['clip_path'] is None
+
+
+def test_provider_secret_is_redacted_before_failure_is_persisted(tmp_path):
+    from video_agent.config import AdapterConfig
+    planner = ScriptedPlanner(error=VideoAgentError('PROVIDER_REJECTED', 'upstream token private-provider-key rejected'))
+    agent, _ = make(tmp_path, planner)
+    image = agent.register_asset(filename='a.png', kind='image', data=_png())
+    task = agent.create_task(CreateTaskRequest(images=[image], product_info=ProductInfo(name='杯子')))
+    agent.config.adapters['planner'] = AdapterConfig(adapter='fake', api_key='private-provider-key')
+    agent.tick()
+    agent.tick()
+    assert 'private-provider-key' not in agent.get_task(task.task_id).failure.message
+    with agent.db.transaction(write=False) as conn:
+        assert 'private-provider-key' not in str(conn.execute('SELECT * FROM tasks WHERE task_id=:id', {'id': task.task_id}).fetchone())
+
+
+@pytest.mark.parametrize('key', ['', 'invalid-key'])
+def test_worker_entry_rejects_invalid_key_before_database(key, monkeypatch):
+    from video_agent.runtime import RuntimeSettings
+    from video_agent.worker_main import main
+    monkeypatch.setattr('video_agent.runtime.RuntimeSettings.from_env', lambda **kw: RuntimeSettings(secret_key=key))
+    monkeypatch.setattr('video_agent.db.Database.from_settings', lambda *_: pytest.fail('DB connected with invalid key'))
+    assert main() == 1
+
+
+def test_worker_database_failure_propagates_and_releases_singleton(tmp_path, monkeypatch):
+    import threading
+    from video_agent.provider_jobs import ensure_worker_schema
+    from video_agent.worker_main import run_worker
+    agent, _ = make(tmp_path, ScriptedPlanner())
+    ensure_worker_schema(agent.db)
+    def fail(): raise RuntimeError('private DB detail')
+    monkeypatch.setattr(agent, 'tick', fail)
+    with pytest.raises(RuntimeError, match='Worker execution failed'):
+        run_worker(agent, threading.Event())
+    with agent.db.transaction(write=False) as conn:
+        row = conn.execute('SELECT * FROM worker_heartbeats WHERE singleton_id=1').fetchone()
+    assert row['worker_owner'] is None and row['stopping'] == 1

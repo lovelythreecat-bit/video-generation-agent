@@ -80,6 +80,7 @@ def test_real_mode_optional_fake_and_none():
         def build(self, fields: dict[str, str]) -> object:
             return {"fields": fields}
 
+    saved = dict(REAL_ADAPTERS)
     REAL_ADAPTERS["demo"] = Spec()
     try:
         payload = _default_config()
@@ -99,6 +100,7 @@ def test_real_mode_optional_fake_and_none():
         assert isinstance(visual, NoneVisual)
     finally:
         REAL_ADAPTERS.clear()
+        REAL_ADAPTERS.update(saved)
 
 
 def _default_config() -> dict:

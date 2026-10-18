@@ -4,3 +4,9 @@ __pycache__/
 .pytest_cache/
 .venv/
 *.egg-info/
+.env
+.env.*
+!.env.example
+.agent-runs/
+build/
+dist/
