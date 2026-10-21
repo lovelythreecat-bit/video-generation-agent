@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="540" viewBox="0 0 1200 540" role="img" aria-labelledby="title desc">
+  <title id="title">Video Agent — 从商品资料到视频成片</title>
+  <desc id="desc">流程示意：商品资料进入分镜规划，人工确认方案后生成视频成片。以剪辑时间轴表达可确认、可调整的电商视频生成流程。</desc>
+  <rect width="1200" height="540" rx="24" fill="#11191c"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', 'PingFang SC', sans-serif">
+    <g id="project-title">
+      <text x="60" y="62" fill="#96aaa9" font-size="20" letter-spacing="3">PRODUCT → STORYBOARD → VIDEO</text>
+      <text x="56" y="166" fill="#f3f5ee" font-size="100" font-weight="700" letter-spacing="-4">Video Agent</text>
+      <text x="62" y="224" fill="#f3f5ee" font-size="36">先确认分镜，再生成成片。</text>
+      <g transform="translate(1016 86)" fill="none" stroke="#70e3bd" stroke-width="4">
+        <rect width="116" height="80" rx="12"/>
+        <path d="M45 23 76 40 45 57Z" fill="#70e3bd" stroke="none"/>
+        <path d="M16 0v80M100 0v80" stroke-width="2" opacity="0.5"/>
+      </g>
+    </g>
+    <g id="storyboard-sequence">
+      <path d="M62 284H1138" stroke="#314144" stroke-width="2"/>
+      <g transform="translate(62 310)">
+        <text y="24" font-size="22" fill="#96aaa9" font-family="Consolas, monospace">01 / INPUT</text>
+        <text y="84" font-size="40" font-weight="600" fill="#f3f5ee">商品资料</text>
+        <rect y="110" width="242" height="44" rx="6" fill="#2c4244"/>
+        <path d="M18 132H220" stroke="#96aaa9" stroke-width="2"/>
+        <path d="M18 124V140M86 124V140M154 124V140M220 124V140" stroke="#96aaa9" stroke-width="2"/>
+      </g>
+      <g transform="translate(340 310)">
+        <text y="24" font-size="22" fill="#96aaa9" font-family="Consolas, monospace">02 / PLAN</text>
+        <text y="84" font-size="40" font-weight="600" fill="#f3f5ee">分镜规划</text>
+        <g fill="#466566">
+          <rect y="110" width="74" height="44" rx="6"/>
+          <rect x="84" y="110" width="74" height="44" rx="6"/>
+          <rect x="168" y="110" width="74" height="44" rx="6"/>
+        </g>
+      </g>
+      <g transform="translate(618 310)">
+        <text y="24" font-size="22" fill="#70e3bd" font-family="Consolas, monospace">03 / CONFIRM</text>
+        <text y="84" font-size="40" font-weight="600" fill="#70e3bd">人工确认</text>
+        <rect y="110" width="242" height="44" rx="6" fill="#70e3bd"/>
+        <path d="m109 131 9 9 17-18" fill="none" stroke="#11191c" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+      </g>
+      <g transform="translate(896 310)">
+        <text y="24" font-size="22" fill="#96aaa9" font-family="Consolas, monospace">04 / EXPORT</text>
+        <text y="84" font-size="40" font-weight="600" fill="#f3f5ee">视频成片</text>
+        <rect y="110" width="242" height="44" rx="6" fill="#e4c68c"/>
+        <path d="m114 121 18 11-18 11Z" fill="#11191c"/>
+      </g>
+      <g fill="none" stroke="#96aaa9" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M311 366h16m-6-6 6 6-6 6"/>
+        <path d="M589 366h16m-6-6 6 6-6 6"/>
+        <path d="M867 366h16m-6-6 6 6-6 6"/>
+      </g>
+    </g>
+    <g id="caption" font-size="18" fill="#96aaa9">
+      <text x="62" y="506">Seedance / Wan</text>
+      <text x="1138" y="506" text-anchor="end">工作流程示意 · 非生成效果展示</text>
+    </g>
+  </g>
+</svg>
