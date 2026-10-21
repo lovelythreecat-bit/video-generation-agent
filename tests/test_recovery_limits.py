@@ -86,27 +86,20 @@ class LongVoice:
         return VoiceResult(audio=b"too-long", cues=[VoiceCue(text="卖点", start_ms=0, end_ms=30000)], duration_ms=30000)
 
 
-def test_voiceover_that_still_does_not_fit_at_double_speed(tmp_path: Path):
+def test_unused_independent_voice_does_not_block_export(tmp_path: Path):
     require_ffmpeg()
     agent = make_agent(tmp_path)
     agent.voice = LongVoice()
     task, _image = open_plan(agent, duration=5)
     agent.confirm(task.task_id, int(agent.get_task(task.task_id).head_plan_version))
-    failed = drain(agent, task.task_id)
-    assert failed.status == "failed"
-    assert failed.failure is not None
-    assert failed.failure.code == "VOICEOVER_DOES_NOT_FIT"
-    assert failed.failure.stage == "preparing_audio"
-    assert failed.failure.retryable is False
+    finished = drain(agent, task.task_id)
+    assert finished.status == "succeeded"
+    assert finished.failure is None
     used = read_rows(
-        agent.home,
-        "SELECT auto_attempts_used FROM generations WHERE generation_id=?",
-        (failed.generation_id,),
+        agent.home, "SELECT auto_attempts_used FROM generations WHERE generation_id=?",
+        (finished.generation_id,),
     )[0]
     assert used["auto_attempts_used"] == 0
-    with pytest.raises(VideoAgentError) as caught:
-        agent.retry_generation(failed.generation_id)
-    assert caught.value.code == "STATE_CONFLICT"
 
 
 def test_missing_asset_does_not_resubmit_the_video_model(tmp_path: Path):
@@ -133,7 +126,7 @@ def test_missing_asset_does_not_resubmit_the_video_model(tmp_path: Path):
             "SELECT step FROM work_items WHERE task_id=? AND kind='generation' ORDER BY ready_at DESC LIMIT 1",
             (task.task_id,),
         )[0]["step"]
-        if step == "audio":
+        if step == "export":
             break
         result = agent.tick()
         if not result.did_work:
@@ -141,10 +134,9 @@ def test_missing_asset_does_not_resubmit_the_video_model(tmp_path: Path):
     assert submits["count"] == 1
     relative = read_rows(agent.home, "SELECT relative_path FROM assets WHERE asset_id=?", (music_id,))[0]["relative_path"]
     (agent.home / relative).unlink()
-    failed = drain(agent, task.task_id)
-    assert failed.status == "failed"
-    assert failed.failure is not None
-    assert failed.failure.code == "ASSET_MISSING"
+    finished = drain(agent, task.task_id)
+    assert finished.status == "succeeded"
+    assert finished.failure is None
     assert submits["count"] == 1
 
     bare = make_agent(tmp_path / "bare")

@@ -109,14 +109,14 @@ def test_structured_revise_redistributes_and_sets_fit(tmp_path: Path):
 
 def test_revise_validation_does_not_publish_or_store_idempotency(tmp_path: Path):
     agent, task_id = seed(tmp_path)
-    silent = document(subtitles=False, text="")
+    silent = document(subtitles=False, text="").model_copy(update={"voiceover": False})
     with agent.db.transaction() as conn:
         conn.execute("DELETE FROM plan_versions WHERE task_id=?", (task_id,))
         publish_document(conn, task_id=task_id, document=silent, now=agent.clock.now().isoformat())
     cases = [
         PlanChange(),
         PlanChange(instruction="改", patch=PlanPatch(duration_seconds=5)),
-        PlanChange(patch=PlanPatch(subtitles=True)),
+        PlanChange(patch=PlanPatch(voiceover=True)),
         PlanChange(patch=PlanPatch(shots=[], shot_texts=[ShotTextPatch(shot_id="s1", content="新")])),
     ]
     for change in cases:
@@ -130,6 +130,18 @@ def test_revise_validation_does_not_publish_or_store_idempotency(tmp_path: Path)
     assert count == 1
     assert keys == 0
     assert head == 1
+
+
+def test_enabling_native_text_allows_shots_without_copy(tmp_path: Path):
+    agent, task_id = seed(tmp_path)
+    agent.revise_plan(task_id, PlanChange(patch=PlanPatch(
+        subtitles=False,
+        shot_texts=[ShotTextPatch(shot_id="s2", subtitle_text="")],
+    )))
+    changed = agent.revise_plan(task_id, PlanChange(patch=PlanPatch(subtitles=True)))
+    updated = agent.get_plan(task_id, changed.head_plan_version).document
+    assert updated.subtitles is True
+    assert [shot.subtitle_text for shot in updated.shots] == ["卖点", ""]
 
 
 def test_natural_language_revise_keeps_head_and_queues_planning(tmp_path: Path):

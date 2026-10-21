@@ -19,7 +19,7 @@ from tests.recovery_support import (
 )
 from video_agent.errors import VideoAgentError
 from video_agent.media import extract_png, probe, still_clip
-from video_agent.models import RegenerateRequest
+from video_agent.models import PlanChange, PlanPatch, RegenerateRequest, ShotTextPatch
 from video_agent.ports import QueryResult, ShotRequest, SubmitResult
 
 
@@ -72,7 +72,7 @@ def _pixels(path: Path) -> bytes:
     return Image.open(path).convert("RGB").tobytes()
 
 
-def test_shot_regenerate_reuses_audio_and_keeps_kind(tmp_path: Path):
+def test_shot_regenerate_works_without_base_audio_and_keeps_kind(tmp_path: Path):
     agent, task_id, finished = _two_shot_film(tmp_path)
     base = agent.list_artifacts(task_id)[0]
     base_dir = generation_dir(agent, task_id, finished.generation_id)
@@ -89,11 +89,51 @@ def test_shot_regenerate_reuses_audio_and_keeps_kind(tmp_path: Path):
     assert agent.voice.calls == voice_calls
     assert agent.music.calls == music_calls
     new_dir = generation_dir(agent, task_id, again.generation_id)
-    assert digest(new_dir / "voice.m4a") == digest(base_dir / "voice.m4a")
-    assert digest(new_dir / "music.m4a") == digest(base_dir / "music.m4a")
-    assert digest(new_dir / "cues.json") == digest(base_dir / "cues.json")
+    for directory in (base_dir, new_dir):
+        for name in ("voice.m4a", "music.m4a", "cues.json"):
+            assert not (directory / name).exists()
     assert agent.artifact_path(base.artifact_id).is_file()
     assert len(agent.list_artifacts(task_id)) == 2
+
+
+@pytest.mark.parametrize("second_text", ["", "清爽一口"])
+def test_selected_regeneration_keeps_native_text_and_reuses_other_shots(tmp_path: Path, second_text):
+    require_ffmpeg()
+    agent = make_agent(tmp_path)
+    agent.video = ColoredVideo()
+    task, _image = open_plan(agent)
+    revise_two_shots(agent, task.task_id)
+    agent.revise_plan(task.task_id, PlanChange(patch=PlanPatch(shot_texts=[
+        ShotTextPatch(shot_id="s1", subtitle_text="轻巧随行"),
+        ShotTextPatch(shot_id="s2", subtitle_text=second_text),
+    ])))
+    finished = confirm_and_finish(agent, task.task_id)
+    assert finished.status == "succeeded"
+    base = agent.list_artifacts(task.task_id)[0]
+    base_dir = generation_dir(agent, task.task_id, finished.generation_id)
+    first, second = agent.video.requests
+    assert "轻巧随行" in first.prompt
+    assert "轻巧随行" not in second.prompt
+    if second_text:
+        assert "清爽一口" in second.prompt
+    else:
+        assert "不要新增" in second.prompt
+    assert second.first_frame_path == base_dir / "first_frame_fitted.png"
+
+    agent.video.requests.clear()
+    agent.regenerate(task.task_id, RegenerateRequest(
+        kind="shots", artifact_id=base.artifact_id, shot_ids=["s1"],
+    ))
+    again = drain(agent, task.task_id)
+    assert again.status == "succeeded"
+    assert [item.shot_id for item in agent.video.requests] == ["s1"]
+    assert "轻巧随行" in agent.video.requests[0].prompt
+    if second_text:
+        assert agent.video.requests[0].tail_frame_path is None
+    new_dir = generation_dir(agent, task.task_id, again.generation_id)
+    assert digest(new_dir / "shots" / "s2.mp4") == digest(base_dir / "shots" / "s2.mp4")
+    assert not (new_dir / "subtitled.mp4").exists()
+    assert not (new_dir / "subtitled.ass").exists()
 
 
 def test_replaced_left_neighbor_uses_new_end_frame(tmp_path: Path):

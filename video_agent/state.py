@@ -277,8 +277,6 @@ def apply_patch(
                 cursor += length
             shots = resized
     validate_frame_span(shots, duration * 30)
-    if subtitles and not document.subtitles and any(shot.subtitle_text.strip() == "" for shot in shots):
-        raise VideoAgentError("VALIDATION_ERROR", "打开字幕时每个镜头都要有字幕文案", fields=["subtitles"])
     if voiceover and not document.voiceover and any(shot.voiceover_text.strip() == "" for shot in shots):
         raise VideoAgentError("VALIDATION_ERROR", "打开配音时每个镜头都要有配音文案", fields=["voiceover"])
     if music and not document.music and music_direction.strip() == "" and not music_asset_id:

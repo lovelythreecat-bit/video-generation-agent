@@ -183,7 +183,7 @@ def test_expired_generation_owner_cannot_write_any_outcome(agent, tmp_path):
     before = snapshot()
     actions = [
         lambda: pipeline._enter(execution, work, 'submit_shot'),
-        lambda: pipeline._advance(execution, work, 'audio'),
+        lambda: pipeline._advance(execution, work, 'export'),
         lambda: pipeline._mark_intended(execution, confirmed.generation_id, 's1', 'key'),
         lambda: pipeline._mark_submission(execution, confirmed.generation_id, 's1', 'accepted', 'remote', 'submitted'),
         lambda: pipeline._mark_imported(execution, confirmed.generation_id, 's1', 'final.mp4', source=source),
@@ -278,7 +278,7 @@ def test_runtime_expiry_after_claim_before_mysql_commit_rolls_back(agent, monkey
     assert_runtime_expiry_before_claim_commit(agent, monkeypatch)
 
 
-@pytest.mark.parametrize('stage', ['first_frame', 'audio', 'compose', 'visual', 'export_subtitles', 'reuse_audio'])
+@pytest.mark.parametrize('stage', ['first_frame', 'export'])
 def test_stale_mysql_stage_cannot_replace_published_files(agent, tmp_path, monkeypatch, stage):
     from tests.test_review_fences import assert_late_stage_cannot_replace_media_or_sidecars
     assert_late_stage_cannot_replace_media_or_sidecars(tmp_path, monkeypatch, stage, agent=agent)

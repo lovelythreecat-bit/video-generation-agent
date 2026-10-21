@@ -241,17 +241,42 @@ def test_submit_writes_intended_before_the_provider_returns(tmp_path: Path):
     assert _step(home, confirmed.generation_id)[0] == "import_shot"
 
 
-def test_import_trims_long_clips_and_stops_before_audio(tmp_path: Path):
+@pytest.mark.parametrize("enabled,text", [(True, "轻巧随行"), (False, "轻巧随行"), (True, "")])
+def test_native_text_reaches_video_provider_only_when_requested(tmp_path, enabled, text):
+    _need_ffmpeg()
+
+    class TextPlanner(TwoShotPlanner):
+        def plan(self, request):
+            result = super().plan(request)
+            result.document.subtitles = enabled
+            result.document.shots[0].subtitle_text = text
+            return result
+
+    video = RecordingVideo(Path("."))
+    agent, _home_path, _confirmed_task = _confirmed(tmp_path, video, TextPlanner())
+    agent.tick()
+    agent.tick()
+    prompt = video._requests["ext-s1"].prompt
+    assert "前段" in prompt
+    if enabled and text:
+        assert "轻巧随行" in prompt
+        assert "文字" in prompt
+    else:
+        assert "轻巧随行" not in prompt
+        assert "不要新增" in prompt
+
+
+def test_import_trims_long_clips_and_stops_before_export(tmp_path: Path):
     _need_ffmpeg()
     from video_agent.media import probe
 
     video = RecordingVideo(Path("."), extra_frames=4)
     agent, home, confirmed = _confirmed(tmp_path, video)
     for _ in range(6):
-        if _step(home, confirmed.generation_id)[0] == "audio":
+        if _step(home, confirmed.generation_id)[0] == "export":
             break
         agent.tick()
-    assert _step(home, confirmed.generation_id)[0] == "audio"
+    assert _step(home, confirmed.generation_id)[0] == "export"
     clip = home / "tasks" / confirmed.task_id / "generations" / confirmed.generation_id / "shots" / "s1.mp4"
     assert probe(clip).frame_count == 150
     connection = sqlite3.connect(home / "agent.sqlite")
@@ -306,7 +331,7 @@ def test_pending_query_defers_until_the_lease_expires(tmp_path: Path):
     assert next_attempt is not None
     agent.clock.advance(16)
     agent.tick()
-    assert _step(home, confirmed.generation_id)[0] == "audio"
+    assert _step(home, confirmed.generation_id)[0] == "export"
     assert video.queries == 2
 
 
@@ -350,7 +375,7 @@ def test_two_shots_import_in_order(tmp_path: Path):
     video = RecordingVideo(Path("."))
     agent, home, confirmed = _confirmed(tmp_path, video, planner=TwoShotPlanner())
     for _ in range(10):
-        if _step(home, confirmed.generation_id)[0] == "audio":
+        if _step(home, confirmed.generation_id)[0] == "export":
             break
         agent.tick()
     assert [item[0] for item in video.seen] == ["s1", "s2"]

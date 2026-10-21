@@ -347,7 +347,7 @@ class VideoAgent:
                 width=row["width"],
                 height=row["height"],
                 quality_status=row["quality_status"],
-                visual_check_enabled=_artifact_visual_check_enabled(row["generation_config"]),
+                visual_check_enabled=_artifact_visual_check_enabled(row["generation_config"], row["quality_json"]),
                 quality=json.loads(row["quality_json"]),
                 created_at=row["created_at"],
             )
@@ -864,13 +864,19 @@ def _check_first_frame(first: str | None, images: list[str]) -> str | None:
     return first
 
 
-def _artifact_visual_check_enabled(raw_snapshot: str | None) -> bool | None:
-    """Project only the check switch frozen when this generation was confirmed.
+def _artifact_visual_check_enabled(raw_snapshot: str | None, raw_quality: str | None = None) -> bool | None:
+    """Read explicit export policy, falling back to historical generation settings.
 
     The public half of an encrypted snapshot contains adapter names. Never decrypt
     or return credentials just to describe review policy. Unknown legacy data must
     not authorize delivery of an unchecked artifact.
     """
+    if raw_quality is not None:
+        try:
+            if json.loads(raw_quality).get("visual_check_enabled") is False:
+                return False
+        except (ValueError, TypeError, AttributeError):
+            pass
     try:
         snapshot = json.loads(raw_snapshot)
         if snapshot.get("format_version") == 1:

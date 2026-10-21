@@ -11,12 +11,8 @@ from tests.recovery_support import (
 from video_agent.models import RegenerateRequest
 
 
-def test_full_regenerate_rebuilds_shots_and_audio(tmp_path: Path):
+def test_full_regenerate_rebuilds_shots_without_independent_audio(tmp_path: Path):
     require_ffmpeg()
-    from video_agent.pipeline import rebuilds_audio
-
-    assert rebuilds_audio("full") is True
-    assert rebuilds_audio("shots") is False
     agent = make_agent(tmp_path)
     from tests.recovery_support import CountingMusic, CountingVoice
 
@@ -25,8 +21,8 @@ def test_full_regenerate_rebuilds_shots_and_audio(tmp_path: Path):
     task, _image = open_plan(agent)
     finished = confirm_and_finish(agent, task.task_id)
     assert finished.status == "succeeded"
-    assert agent.voice.calls == 1
-    assert agent.music.calls == 1
+    assert agent.voice.calls == 0
+    assert agent.music.calls == 0
     old = agent.list_artifacts(task.task_id)[0]
     old_path = agent.artifact_path(old.artifact_id)
     agent.regenerate(task.task_id, RegenerateRequest(kind="full"))
@@ -36,8 +32,8 @@ def test_full_regenerate_rebuilds_shots_and_audio(tmp_path: Path):
     view = agent.get_generation(again.generation_id)
     assert view.kind == "full"
     assert view.shot_ids
-    assert agent.voice.calls == 2
-    assert agent.music.calls == 2
+    assert agent.voice.calls == 0
+    assert agent.music.calls == 0
     artifacts = agent.list_artifacts(task.task_id)
     assert [item.version for item in artifacts] == [2, 1]
     assert old_path.is_file()

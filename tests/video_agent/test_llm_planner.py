@@ -81,6 +81,33 @@ def test_plan_json_becomes_contiguous_frames():
     assert document.model_capabilities == "note"
 
 
+@pytest.mark.parametrize("blank_shots", [[0], [0, 1]])
+def test_native_text_can_be_omitted_on_any_shot(blank_shots):
+    payload = _plan()
+    for index in blank_shots:
+        payload["shots"][index]["subtitle_text"] = ""
+    result = interpret_plan(json.dumps(payload), _request(), "note")
+    assert result.document.subtitles is True
+    assert [shot.subtitle_text for shot in result.document.shots] == [
+        item["subtitle_text"] for item in payload["shots"]
+    ]
+
+
+def test_revision_can_enable_native_text_with_blank_shots():
+    from video_agent.llm_planner import interpret_revision
+
+    request = _request()
+    current = interpret_plan(json.dumps(_plan()), request, "note").document
+    current.subtitles = False
+    payload = _plan()
+    payload["subtitles"] = True
+    payload["shots"][1]["subtitle_text"] = ""
+    result = interpret_revision(json.dumps(payload), current, request)
+    assert result.patch.subtitles is True
+    assert result.patch.shots[0].subtitle_text == "很轻"
+    assert result.patch.shots[1].subtitle_text == ""
+
+
 def test_plan_rejects_seconds_that_do_not_add_up():
     payload = _plan()
     payload["shots"][1]["seconds"] = 4

@@ -150,7 +150,7 @@ class MainWindow(tk.Tk):
         self._combo(demand, "画面比例", self.aspect_var, list(ASPECT_RATIOS))
         switches = ttk.Frame(demand)
         switches.pack(anchor="w", pady=2)
-        ttk.Checkbutton(switches, text="字幕", variable=self.subtitles_var).pack(side="left")
+        ttk.Checkbutton(switches, text="画面文字", variable=self.subtitles_var).pack(side="left")
         ttk.Checkbutton(switches, text="有声", variable=self.sound_var).pack(side="left")
         picture_row = ttk.Frame(demand)
         picture_row.pack(fill="x", pady=2)
@@ -183,7 +183,7 @@ class MainWindow(tk.Tk):
         self._combo(plan, "比例适配", self.plan_fit_var, ["native", "pad", "crop"])
         plan_switches = ttk.Frame(plan)
         plan_switches.pack(anchor="w")
-        ttk.Checkbutton(plan_switches, text="字幕", variable=self.plan_subtitles_var).pack(side="left")
+        ttk.Checkbutton(plan_switches, text="画面文字", variable=self.plan_subtitles_var).pack(side="left")
         ttk.Checkbutton(plan_switches, text="有声", variable=self.plan_sound_var).pack(side="left")
         self._entry(plan, "方案语言", self.plan_language_var)
         ttk.Label(plan, text="镜头文案").pack(anchor="w")
@@ -442,7 +442,7 @@ class MainWindow(tk.Tk):
                 ("shot_size", "景别", shot.shot_size, 8),
                 ("camera", "运镜", shot.camera, 8),
                 ("scene_id", "场景", shot.scene_id, 8),
-                ("subtitle_text", "字幕", shot.subtitle_text, 12),
+                ("subtitle_text", "画面文字（可留空）", shot.subtitle_text, 12),
                 ("voiceover_text", "配音", shot.voiceover_text, 12),
             ):
                 ttk.Label(row, text=label).pack(side="left")

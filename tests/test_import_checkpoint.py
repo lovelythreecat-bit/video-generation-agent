@@ -63,14 +63,14 @@ def restart(agent, video):
     return resumed
 
 
-def reach_audio(agent, generation_id):
+def reach_export(agent, generation_id):
     for _ in range(8):
         with agent.db.transaction(write=False) as conn:
             step = conn.execute('SELECT step FROM work_items WHERE generation_id=:id', {'id': generation_id}).fetchone()['step']
-        if step == 'audio' or agent.get_generation(generation_id).status == 'failed':
+        if step == 'export' or agent.get_generation(generation_id).status == 'failed':
             return step
         agent.tick()
-    raise AssertionError('import recovery did not reach audio')
+    raise AssertionError('import recovery did not reach export')
 
 
 def assert_legacy_import_checkpoint_recovers(agent, monkeypatch, detail, predecessor):
@@ -89,7 +89,7 @@ def assert_legacy_import_checkpoint_recovers(agent, monkeypatch, detail, predece
         conn.execute('UPDATE generations SET stage_detail=:detail WHERE generation_id=:id', {'detail': detail, 'id': generation.generation_id})
         before_first = dict(conn.execute("SELECT * FROM generation_shots WHERE generation_id=:id AND shot_id='s1'", {'id': generation.generation_id}).fetchone())
     resumed = restart(agent, video)
-    assert reach_audio(resumed, generation.generation_id) == 'audio'
+    assert reach_export(resumed, generation.generation_id) == 'export'
     with agent.db.transaction(write=False) as conn:
         first_row = dict(conn.execute("SELECT * FROM generation_shots WHERE generation_id=:id AND shot_id='s1'", {'id': generation.generation_id}).fetchone())
         second = conn.execute("SELECT * FROM generation_shots WHERE generation_id=:id AND shot_id='s2'", {'id': generation.generation_id}).fetchone()
@@ -163,10 +163,10 @@ def assert_import_checkpoint_is_atomic(agent, monkeypatch, crash, last):
         saved_work = conn.execute('SELECT * FROM work_items WHERE work_id=:id', {'id': work['work_id']}).fetchone()
         shot = conn.execute("SELECT * FROM generation_shots WHERE generation_id=:id AND shot_id='s1'", {'id': generation.generation_id}).fetchone()
     assert shot['status'] == 'imported' and first.read_bytes() == b'clip-remote-s1'
-    assert saved_work['step'] == ('audio' if last else 'submit_shot')
+    assert saved_work['step'] == ('export' if last else 'submit_shot')
     assert saved_work['lease_owner'] is None and saved_work['lease_until'] is None
     resumed = restart(agent, video)
-    assert reach_audio(resumed, generation.generation_id) == 'audio'
+    assert reach_export(resumed, generation.generation_id) == 'export'
     assert first.read_bytes() == b'clip-remote-s1'
     expected = [('download', 'remote-s1')]
     if not last:

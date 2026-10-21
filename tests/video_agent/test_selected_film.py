@@ -1,8 +1,4 @@
 import itertools
-import math
-import struct
-import subprocess
-import wave
 from pathlib import Path
 
 import pytest
@@ -22,11 +18,6 @@ def _need_ffmpeg() -> None:
 
     if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
         pytest.skip("ffmpeg and ffprobe are required")
-
-
-def _has_font() -> bool:
-    font_dir = Path(r"C:\Windows\Fonts")
-    return any((font_dir / name).is_file() for name in ("msyh.ttc", "msyh.ttf", "simhei.ttf", "segoeui.ttf", "arial.ttf"))
 
 
 def _home(tmp_path: Path) -> Path:
@@ -95,8 +86,6 @@ class CountingMusic:
 
 def _export(tmp_path: Path, *, aspect: str, size: tuple[int, int], color: tuple[int, int, int], subtitles: bool, voiceover: bool, music: bool):
     _need_ffmpeg()
-    if subtitles and not _has_font():
-        pytest.skip("no Windows font for subtitles")
     home = _home(tmp_path)
     voice = CountingVoice()
     music_provider = CountingMusic()
@@ -201,43 +190,20 @@ def test_eight_switches(tmp_path: Path, subtitles: bool, voiceover: bool, music:
     artifact = agent.list_artifacts(finished.task_id)[0]
     info = probe(agent.artifact_path(artifact.artifact_id))
     assert info.frame_count == 150
-    assert info.has_audio is (voiceover or music)
-    if voiceover or music:
-        assert info.audio_codec == "aac"
-    assert voice.calls == (1 if voiceover else 0)
-    assert music_provider.calls == (1 if music else 0)
+    assert info.has_audio is False
+    assert voice.calls == 0
+    assert music_provider.calls == 0
     final = agent.artifact_path(artifact.artifact_id)
     if subtitles:
         png = tmp_path / "bottom.png"
         extract_png(final, 10, png)
         frame = Image.open(png).convert("RGB")
         changed = any(
-            frame.getpixel((x, y)) != (220, 10, 10)
+            frame.getpixel((x, y)) != frame.getpixel((90, 160))
             for y in range(int(320 * 0.80), int(320 * 0.92))
             for x in range(36, 144)
         )
-        assert changed is True
-    if voiceover and music:
-        quiet = _rms_db(final, 0.6, 0.4, 200)
-        loud = _rms_db(final, 3.2, 0.5, 200)
-        assert -16 <= quiet - loud <= -8
-
-
-def _rms_db(path: Path, start: float, duration: float, frequency: int) -> float:
-    wav = path.with_name(f"{path.stem}-{start}.wav")
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-ss", str(start), "-t", str(duration), "-i", str(path),
-            "-af", f"bandpass=f={frequency}:width_type=h:width=30",
-            "-ac", "1", "-ar", "8000", str(wav),
-        ],
-        check=True,
-        capture_output=True,
-        stdin=subprocess.DEVNULL,
-    )
-    with wave.open(str(wav), "rb") as handle:
-        count = handle.getnframes()
-        raw = handle.readframes(count)
-    samples = struct.unpack("<" + "h" * count, raw)
-    mean_square = sum(sample * sample for sample in samples) / count
-    return 10 * math.log10(mean_square)
+        assert changed is False
+        root = final.parent
+        assert not (root / "subtitled.mp4").exists()
+        assert not (root / "subtitled.ass").exists()

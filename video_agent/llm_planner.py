@@ -18,7 +18,12 @@ shared_visual 对象（product_reference, scene, lighting, palette, style，可�
 shots 数组。每个镜头含 content, action, shot_size, camera, scene_id, seconds, subtitle_text, voiceover_text。
 另有 music_direction, language。
 seconds 是正整数。所有镜头的 seconds 相加必须等于 duration_seconds。单个镜头不能超过 max_segment_seconds。
-字幕关闭时 subtitle_text 为空。配音关闭时 voiceover_text 为空。音乐关闭时 music_direction 为空。
+subtitles 表示允许视频模型在生成画面时直接生成文字，不做后期叠字。
+subtitles 开启时，只在确有需要的镜头用 subtitle_text 安排少量简短标题或卖点，优先 2–8 个字。
+不需要文字的镜头 subtitle_text 留空，允许所有镜头都留空；不要强制每镜头有字、重复文案或堆砌长句。
+subtitle_text 只写需要出现在画面里的确切文案，位置、字体风格、出场方式写在该镜头 content 中，与整体视觉风格融合且不遮挡产品。
+用户明确指定文案时保留原文，不自行编造商品事实；用户要求无文字或 subtitles 关闭时，不在镜头内容安排新增文字，subtitle_text 为空。
+配音关闭时 voiceover_text 为空。音乐关闭时 music_direction 为空。
 默认整条片子同一个 scene_id。只有用户明确要求换场景时才换。"""
 
 
@@ -285,8 +290,6 @@ def _shots(raw: object, duration_seconds: int, max_segment_seconds: int) -> list
 
 
 def _require_copy(request: PlanRequest, shots: list[ShotPlan], music_direction: str) -> None:
-    if request.subtitles and any(shot.subtitle_text.strip() == "" for shot in shots):
-        raise VideoAgentError("PROVIDER_REJECTED", "字幕开着，但有镜头没有字幕", retryable=True)
     if request.voiceover and any(shot.voiceover_text.strip() == "" for shot in shots):
         raise VideoAgentError("PROVIDER_REJECTED", "配音开着，但有镜头没有配音", retryable=True)
     if request.music and music_direction.strip() == "" and not request.audio.music_asset_id:

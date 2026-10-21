@@ -65,6 +65,32 @@ try {
                 if ($logLevel -notin @('critical', 'error', 'warning', 'info', 'debug', 'trace')) {
                     throw 'VIDEO_AGENT_API_LOG_LEVEL must be critical, error, warning, info, debug or trace.'
                 }
+                # Only stop this project's API, never an unrelated port owner.
+                $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
+                    Where-Object { $_.LocalPort -eq $port })
+                $processIds = @($listeners | Select-Object -ExpandProperty OwningProcess -Unique)
+                $apiCommandPattern = '^"?' + [regex]::Escape(($python -replace '/', '\')) +
+                    '"?\s+-m\s+uvicorn\s+api_app\.app:create_app(?:\s|$)'
+                foreach ($processId in $processIds) {
+                    $owner = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $processId" -ErrorAction Stop
+                    if ($null -eq $owner -or [string]::IsNullOrWhiteSpace($owner.CommandLine) -or
+                        ($owner.CommandLine -replace '/', '\') -notmatch $apiCommandPattern) {
+                        throw "Port $port is occupied by another program (PID $processId). Stop it manually or change VIDEO_AGENT_API_PORT."
+                    }
+                }
+                foreach ($processId in $processIds) {
+                    Write-Host "Stopping existing WebAPI (PID $processId) on port $port."
+                    Stop-Process -Id $processId -Force -ErrorAction Stop
+                    # The process may have already exited before Wait-Process runs.
+                    Wait-Process -Id $processId -Timeout 10 -ErrorAction SilentlyContinue
+                }
+                if ($processIds.Count -gt 0) {
+                    $remaining = @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
+                        Where-Object { $_.LocalPort -eq $port })
+                    if ($remaining.Count -gt 0) {
+                        throw "Port $port is still occupied after stopping the previous WebAPI."
+                    }
+                }
                 Write-Host "Starting WebAPI on ${bindHost}:$port. Press Ctrl+C to stop."
                 & $python -m uvicorn api_app.app:create_app --factory --host $bindHost --port $port --log-level $logLevel
             }

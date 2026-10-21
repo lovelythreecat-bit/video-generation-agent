@@ -19,11 +19,6 @@ def _need_ffmpeg() -> None:
         pytest.skip("ffmpeg and ffprobe are required")
 
 
-def _has_font() -> bool:
-    font_dir = Path(r"C:\Windows\Fonts")
-    return any((font_dir / name).is_file() for name in ("msyh.ttc", "msyh.ttf", "simhei.ttf", "segoeui.ttf", "arial.ttf"))
-
-
 def _home(tmp_path: Path) -> Path:
     home = tmp_path / "va"
     home.mkdir(parents=True)
@@ -207,7 +202,7 @@ class TwoShotPlanner:
         return ReviseResult()
 
 
-def test_closed_audio_exports_silent_film_and_still_checks_visuals(tmp_path: Path):
+def test_closed_audio_exports_silent_film_without_visual_checks(tmp_path: Path):
     from video_agent.media import probe
 
     agent, home, finished = _film(tmp_path)
@@ -216,40 +211,34 @@ def test_closed_audio_exports_silent_film_and_still_checks_visuals(tmp_path: Pat
     artifacts = agent.list_artifacts(finished.task_id)
     assert len(artifacts) == 1
     assert artifacts[0].quality_status == "not_assessed"
-    assert artifacts[0].quality["reason"] == "visual adapter is none"
+    assert artifacts[0].visual_check_enabled is False
     assert (artifacts[0].width, artifacts[0].height) == (180, 320)
     info = probe(agent.artifact_path(artifacts[0].artifact_id))
     assert info.frame_count == 150
     assert info.has_audio is False
     assert info.video_codec == "h264"
     root = home / "tasks" / finished.task_id / "generations" / finished.generation_id / "frames"
-    assert (root / "s1-start.png").is_file()
-    assert (root / "s1-middle.png").is_file()
-    assert (root / "s1-end.png").is_file()
-    assert not (root / "s1-boundary.png").is_file()
+    assert not root.exists()
 
 
-def test_missing_voice_and_music_are_rejected(tmp_path: Path):
+def test_missing_voice_and_music_do_not_prevent_export(tmp_path: Path):
     voice_off = _film(
         tmp_path,
         clear_voice=True,
         video_options=VideoOptions(duration_seconds=5, subtitles=False, voiceover=True, music=False),
     )[2]
-    assert voice_off.failure is not None
-    assert voice_off.failure.code == "PROVIDER_REJECTED"
-    assert voice_off.failure.stage == "preparing_audio"
-    assert voice_off.failure.retryable is True
+    assert voice_off.status == "succeeded"
+    assert voice_off.failure is None
     music_off = _film(
         tmp_path / "music",
         clear_music=True,
         video_options=VideoOptions(duration_seconds=5, subtitles=False, voiceover=False, music=True),
     )[2]
-    assert music_off.failure is not None
-    assert music_off.failure.code == "PROVIDER_REJECTED"
-    assert music_off.failure.stage == "preparing_audio"
+    assert music_off.status == "succeeded"
+    assert music_off.failure is None
 
 
-def test_registered_music_skips_the_music_provider(tmp_path: Path):
+def test_registered_music_is_not_mixed_into_model_video(tmp_path: Path):
     from video_agent.media import probe
 
     home = _home(tmp_path)
@@ -275,44 +264,39 @@ def test_registered_music_skips_the_music_provider(tmp_path: Path):
     assert finished.status == "succeeded"
     assert counter.calls == 0
     info = probe(agent.artifact_path(agent.list_artifacts(created.task_id)[0].artifact_id))
-    assert info.has_audio is True
-    assert info.audio_codec == "aac"
+    assert info.has_audio is False
 
 
-def test_voiceover_that_cannot_fit_is_not_retryable(tmp_path: Path):
+def test_independent_voiceover_is_not_synthesized(tmp_path: Path):
     _need_ffmpeg()
     finished = _film(
         tmp_path,
         voice=LongVoice(),
         video_options=VideoOptions(duration_seconds=5, subtitles=False, voiceover=True, music=False),
     )[2]
-    assert finished.failure is not None
-    assert finished.failure.code == "VOICEOVER_DOES_NOT_FIT"
-    assert finished.failure.retryable is False
-    assert finished.failure.stage == "preparing_audio"
+    assert finished.status == "succeeded"
+    assert finished.failure is None
 
 
-def test_flagged_visual_still_exports(tmp_path: Path):
+def test_configured_visual_checker_is_not_called(tmp_path: Path):
     visual = FlagVisual()
     agent, home, finished = _film(tmp_path, planner=TwoShotPlanner(), visual=visual)
     assert finished.status == "succeeded"
-    positions = {frame.position for frame in visual.frames}
-    assert positions == {"start", "middle", "end", "boundary"}
-    shot_ids = {frame.shot_id for frame in visual.frames}
-    assert shot_ids == {"s1", "s2"}
+    assert visual.frames == []
     artifact = agent.list_artifacts(finished.task_id)[0]
-    assert artifact.quality_status == "flagged"
-    assert artifact.quality["findings"][0]["reason"] == "漂移"
+    assert artifact.quality_status == "not_assessed"
+    assert artifact.visual_check_enabled is False
     root = home / "tasks" / finished.task_id / "generations" / finished.generation_id / "frames"
-    assert (root / "s2-boundary.png").is_file()
+    assert not root.exists()
 
 
-def test_visual_exception_is_not_assessed_and_still_exports(tmp_path: Path):
+def test_unavailable_visual_checker_does_not_affect_export(tmp_path: Path):
     agent, _home_path, finished = _film(tmp_path, visual=BoomVisual())
     assert finished.status == "succeeded"
     artifact = agent.list_artifacts(finished.task_id)[0]
     assert artifact.quality_status == "not_assessed"
-    assert "checker down" in artifact.quality["reason"]
+    assert artifact.visual_check_enabled is False
+    assert "checker down" not in artifact.quality["reason"]
 
 
 def test_failed_final_probe_does_not_register_artifact(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -336,13 +320,12 @@ def test_failed_final_probe_does_not_register_artifact(tmp_path: Path, monkeypat
     root = home / "tasks" / finished.task_id / "generations" / finished.generation_id
     assert not (root / "final.mp4").is_file()
     assert not (root / "final.tmp.mp4").is_file()
-    assert (root / "composed.mp4").is_file()
+    assert (root / "shots" / "s1.mp4").is_file()
+    assert not (root / "composed.mp4").exists()
 
 
-def test_subtitles_are_burned_when_voice_and_music_are_off(tmp_path: Path):
-    if not _has_font():
-        pytest.skip("no Windows font for subtitles")
-    agent, _home_path, finished = _film(
+def test_native_text_option_never_burns_text_during_export(tmp_path: Path):
+    agent, home, finished = _film(
         tmp_path,
         video_options=VideoOptions(duration_seconds=5, subtitles=True, voiceover=False, music=False),
     )
@@ -353,9 +336,13 @@ def test_subtitles_are_burned_when_voice_and_music_are_off(tmp_path: Path):
     png = tmp_path / "bottom.png"
     extract_png(final, 10, png)
     frame = Image.open(png).convert("RGB")
+    background = frame.getpixel((90, 160))
     changed = False
     for y in range(int(320 * 0.80), int(320 * 0.92)):
         for x in range(36, 144):
-            if frame.getpixel((x, y)) != (220, 10, 10):
+            if frame.getpixel((x, y)) != background:
                 changed = True
-    assert changed is True
+    assert changed is False
+    root = home / "tasks" / finished.task_id / "generations" / finished.generation_id
+    assert not (root / "subtitled.mp4").exists()
+    assert not (root / "subtitled.ass").exists()

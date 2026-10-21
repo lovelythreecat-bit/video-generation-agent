@@ -113,6 +113,44 @@ def concat_clips(clips: list[Path], dest: Path, *, keep_audio: bool = False) -> 
     )
 
 
+def export_clips(
+    clips: list[Path], dest: Path, *, keep_audio: bool,
+    video_bitrate: int, audio_bitrate: int,
+) -> None:
+    """Export shots in order, retaining model audio and silent gaps between it."""
+    if not clips:
+        raise VideoAgentError("MEDIA_EXPORT_FAILED", "没有可导出的镜头", stage="exporting", retryable=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if len(clips) == 1:
+        if keep_audio:
+            encode_av(clips[0], dest, video_bitrate, audio_bitrate)
+        else:
+            _encode_video(clips[0], dest, video_bitrate)
+        return
+    inputs: list[str] = []
+    filters: list[str] = []
+    streams: list[str] = []
+    for index, clip in enumerate(clips):
+        inputs.extend(["-i", str(clip)])
+        filters.append(f"[{index}:v:0]setsar=1,setpts=PTS-STARTPTS[v{index}]")
+        streams.append(f"[v{index}]")
+        if keep_audio:
+            info = probe(clip)
+            seconds = info.frame_count / 30
+            if info.has_audio:
+                audio = f"[{index}:a:0]aresample=48000,aformat=channel_layouts=stereo,apad,"
+            else:
+                audio = "anullsrc=r=48000:cl=stereo,"
+            filters.append(f"{audio}atrim=duration={seconds},asetpts=PTS-STARTPTS[a{index}]")
+            streams.append(f"[a{index}]")
+    filters.append("".join(streams) + f"concat=n={len(clips)}:v=1:a={int(keep_audio)}[v]" + ("[a]" if keep_audio else ""))
+    _run_ffmpeg([
+        *inputs, "-filter_complex", ";".join(filters), "-map", "[v]",
+        *(["-map", "[a]"] if keep_audio else []),
+        *_video_args(video_bitrate), *(_audio_args(audio_bitrate) if keep_audio else ["-an"]), str(dest),
+    ])
+
+
 def trim_or_loop_audio(src: Path, duration_seconds: float, dest: Path, *, audio_bitrate: int) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     _run_ffmpeg(

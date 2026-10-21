@@ -14,9 +14,9 @@ class ProductInfo(BaseModel):
 class VideoOptions(BaseModel):
     duration_seconds: int | None = None
     aspect_ratio: str = "9:16"
-    subtitles: bool = True
-    voiceover: bool = True
-    music: bool = True
+    subtitles: bool = Field(default=True, description="允许视频模型按分镜生成画面文字；不做后期叠字。")
+    voiceover: bool = Field(default=True, description="请求视频模型自带音频；不再独立合成配音，无音轨时可导出静音视频。")
+    music: bool = Field(default=True, description="请求视频模型自带音频；不再后期配乐，与 voiceover 同时关闭时移除音轨。")
 
 
 class AudioOptions(BaseModel):
@@ -66,7 +66,7 @@ class ShotPlan(BaseModel):
     scene_id: str
     start_frame: int
     end_frame: int
-    subtitle_text: str = ""
+    subtitle_text: str = Field(default="", description="由视频模型直接生成的画面文字；不需要时留空。")
     voiceover_text: str = ""
 
 
@@ -81,7 +81,7 @@ class PlanDocument(BaseModel):
     duration_seconds: int
     aspect_ratio: str
     fit: Literal["native", "pad", "crop"]
-    subtitles: bool
+    subtitles: bool = Field(description="允许视频模型按分镜生成画面文字；不做后期叠字。")
     voiceover: bool
     music: bool
     first_frame_source: Literal["selected", "generate"]
@@ -98,7 +98,7 @@ class ShotTextPatch(BaseModel):
     shot_size: str | None = None
     camera: str | None = None
     scene_id: str | None = None
-    subtitle_text: str | None = None
+    subtitle_text: str | None = Field(default=None, description="画面文字文案；空字符串表示该镜头无需文字。")
     voiceover_text: str | None = None
 
 
@@ -106,7 +106,7 @@ class PlanPatch(BaseModel):
     duration_seconds: int | None = None
     aspect_ratio: str | None = None
     fit: Literal["native", "pad", "crop"] | None = None
-    subtitles: bool | None = None
+    subtitles: bool | None = Field(default=None, description="允许视频模型按分镜生成画面文字；不做后期叠字。")
     voiceover: bool | None = None
     music: bool | None = None
     language: str | None = None

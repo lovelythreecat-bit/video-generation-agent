@@ -9,8 +9,9 @@ from .conftest import create, plan
     "mode,visual,expected",
     [("fake", "none", False), ("real", "none", False), ("real", "openai_vision", True)],
 )
+@pytest.mark.parametrize("direct_export", [False, True])
 def test_artifact_review_setting_comes_from_generation_snapshot(
-    api, auth, png, mode, visual, expected
+    api, auth, png, mode, visual, expected, direct_export
 ):
     task = create(api, auth, png)
     planned = plan(api, task["task_id"])
@@ -36,7 +37,7 @@ def test_artifact_review_setting_comes_from_generation_snapshot(
                 "ratio": "9:16",
                 "path": "unused.mp4",
                 "quality": "not_assessed",
-                "body": "{}",
+                "body": json.dumps({"visual_check_enabled": False}) if direct_export else "{}",
                 "now": api.agent.clock.now().isoformat(),
             },
         )
@@ -45,7 +46,7 @@ def test_artifact_review_setting_comes_from_generation_snapshot(
     )
     assert response.status_code == 200
     artifact = response.json()[0]
-    assert artifact["visual_check_enabled"] is expected
+    assert artifact["visual_check_enabled"] is (False if direct_export else expected)
     assert artifact["quality_status"] == "not_assessed"
     assert "encrypted_secrets" not in response.text
 

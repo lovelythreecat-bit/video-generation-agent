@@ -383,7 +383,7 @@ def format_plan(plan: PlanView) -> str:
         f"人物：{visual.character or ''}",
         f"换景：{visual.scene_change or ''}",
         f"首帧来源：{doc.first_frame_source}  素材：{doc.first_frame_asset_id or ''}",
-        f"比例适配：{doc.fit}  字幕：{doc.subtitles}  声音：{'有声' if doc.voiceover or doc.music else '无声'}",
+        f"比例适配：{doc.fit}  画面文字：{doc.subtitles}  声音：{'有声' if doc.voiceover or doc.music else '无声'}",
         f"时长：{doc.duration_seconds}  比例：{doc.aspect_ratio}",
         f"模型能力：{doc.model_capabilities}",
     ]

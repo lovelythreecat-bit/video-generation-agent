@@ -34,7 +34,7 @@ def claim_generation(agent, generation_id, step):
     return work, agent._for_work(work)
 
 
-@pytest.mark.parametrize('stage', ['first_frame', 'audio', 'audio_provider', 'music', 'music_trim', 'compose', 'visual', 'visual_frames', 'export_subtitles', 'export_mix', 'reuse_audio'])
+@pytest.mark.parametrize('stage', ['first_frame', 'export'])
 def test_late_stage_cannot_replace_media_or_sidecars(tmp_path, monkeypatch, stage):
     assert_late_stage_cannot_replace_media_or_sidecars(tmp_path, monkeypatch, stage)
 
@@ -46,89 +46,31 @@ def assert_late_stage_cannot_replace_media_or_sidecars(tmp_path, monkeypatch, st
     generation_id = confirmed.generation_id
     root = pipeline._gen_dir(agent, {'task_id': task.task_id, 'generation_id': generation_id})
     root.mkdir(parents=True, exist_ok=True)
-    (root / 'composed.mp4').write_bytes(b'accepted-picture')
-    if stage == 'reuse_audio':
-        base = tmp_path / 'base'
-        base.mkdir()
-        for name in ('voice.m4a', 'music.m4a', 'cues.json'):
-            (base / name).write_bytes(b'base')
-        monkeypatch.setattr(pipeline, '_base_generation_dir', lambda *_: base)
-    step = ('export' if stage.startswith('export') else 'audio' if stage in {'reuse_audio', 'audio_provider', 'music', 'music_trim'}
-            else 'visual' if stage == 'visual_frames' else stage)
-    with agent.db.transaction() as conn:
-        generation = conn.execute('SELECT * FROM generations WHERE generation_id=:id', {'id': generation_id}).fetchone()
-        document = json.loads(generation['snapshot_json'])
-        document['music'] = stage in {'music', 'music_trim'}
-        document['voiceover'] = stage not in {'music', 'music_trim'}
-        conn.execute('UPDATE generations SET snapshot_json=:doc, kind=:kind WHERE generation_id=:id',
-                     {'doc': json.dumps(document), 'kind': 'shots' if stage == 'reuse_audio' else 'full', 'id': generation_id})
-    work, execution = claim_generation(agent, generation_id, step)
+    work, execution = claim_generation(agent, generation_id, stage)
     entered, resume = threading.Event(), threading.Event()
-    info = SimpleNamespace(frame_count=150, has_audio=False)
-    monkeypatch.setattr(pipeline, 'probe', lambda *_: info)
-    monkeypatch.setattr(pipeline, '_generation_clips', lambda *_: [])
+    monkeypatch.setattr(pipeline, 'probe', lambda *_: SimpleNamespace(has_audio=False))
+    monkeypatch.setattr(pipeline, '_generation_clips', lambda *_: [root / 'shots/s1.mp4'])
     monkeypatch.setattr(pipeline, '_assert_final', lambda *_: None)
 
-    def write(dest, data=b'old-media', sidecar=None):
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(data)
-        if sidecar:
-            dest.with_suffix(sidecar).write_bytes(b'old-sidecar')
-
-    def pause():
+    def delayed_write(dest):
         entered.set()
         assert resume.wait(10), 'test did not release delayed writer'
-
-    def delayed_write(dest, sidecar=None):
-        pause()
-        write(dest, sidecar=sidecar)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b'old-media')
+        dest.with_suffix('.concat.txt').write_bytes(b'old-sidecar')
 
     monkeypatch.setattr(pipeline, 'fit_image', lambda *args: delayed_write(args[-1]))
-    monkeypatch.setattr(pipeline, '_atempo_pad', lambda src, speed, seconds, dest, bitrate: write(dest))
-    monkeypatch.setattr(pipeline, '_concat_audio', lambda pieces, dest, bitrate: delayed_write(dest, '.concat.txt') if stage == 'audio' else write(dest, sidecar='.concat.txt'))
-    monkeypatch.setattr(pipeline.media, 'concat_clips', lambda clips, dest, **kw: delayed_write(dest, '.concat.txt'))
-    monkeypatch.setattr(pipeline, 'extract_png', lambda src, frame, dest: delayed_write(dest) if stage == 'visual_frames' else write(dest))
-    execution.voice = SimpleNamespace(synthesize=lambda **kw: ((pause() if stage == 'audio_provider' else None) or SimpleNamespace(audio=b'raw', duration_ms=1000, cues=[])))
-    execution.music = SimpleNamespace(generate=lambda **kw: ((pause() if stage == 'music' else None) or b'raw-music'))
-    monkeypatch.setattr(pipeline, 'trim_or_loop_audio', lambda src, seconds, dest, **kw: delayed_write(dest) if stage == 'music_trim' else write(dest))
-    execution.visual = SimpleNamespace(check=lambda *args: (pause() or pipeline.VisualResult(status='passed')))
-
-    def burn(src, cues, width, height, dest, **kw):
-        if stage == 'export_subtitles':
-            pause()
-        write(dest, sidecar='.ass')
-
-    def mix(src, voice, music, cues, dest, **kw):
-        if stage == 'export_mix':
-            pause()
-        write(dest, sidecar='.wav')
-
-    monkeypatch.setattr(pipeline, 'burn_subtitles', burn)
-    monkeypatch.setattr(pipeline, 'mix_audio', mix)
-    if stage == 'reuse_audio':
-        copy = pipeline.shutil.copyfile
-        def delayed_copy(src, dest):
-            if Path(src).parent == base:
-                pause()
-            return copy(src, dest)
-        monkeypatch.setattr(pipeline.shutil, 'copyfile', delayed_copy)
-
+    monkeypatch.setattr(pipeline.media, 'export_clips', lambda clips, dest, **kw: delayed_write(dest))
     with ThreadPoolExecutor(1) as pool:
-        future = pool.submit(getattr(pipeline, '_step_' + step), execution, work)
+        future = pool.submit(getattr(pipeline, '_step_' + stage), execution, work)
         assert entered.wait(10)
         agent.clock.advance(61)
         with agent.db.transaction() as conn:
             conn.execute("UPDATE work_items SET lease_owner='replacement', lease_until=:until, step='export' WHERE work_id=:id",
                          {'until': (agent.clock.now() + timedelta(seconds=60)).isoformat(), 'id': work['work_id']})
             conn.execute("UPDATE generations SET stage_detail='replacement-published' WHERE generation_id=:id", {'id': generation_id})
-        names = ['first_frame.png', 'first_frame_fitted.png', 'voice-s1.m4a', 'voice-s1.raw.m4a',
-                 'voice.m4a', 'voice.concat.txt', 'music.m4a', 'music.raw.m4a', 'cues.json',
-                 'composed.mp4', 'composed.concat.txt', 'quality.json', 'subtitled.mp4', 'subtitled.ass',
-                 'final.mp4', 'frames/s1-start.png', 'frames/s1-middle.png', 'frames/s1-end.png']
-        for name in names:
-            dest = root / name
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_bytes(b'{"status":"flagged","findings":[],"reason":"replacement"}' if name == 'quality.json' else b'replacement-' + name.encode())
+        for name in ('first_frame.png', 'first_frame_fitted.png', 'final.mp4'):
+            (root / name).write_bytes(b'replacement-' + name.encode())
         before_rows, before_files = rows(agent), files(root)
         resume.set()
         with pytest.raises(LeaseLostError):
